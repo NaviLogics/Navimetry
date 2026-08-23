@@ -29,7 +29,7 @@ def detect_csv_format(path: Path) -> tuple[str, str]:
         )
     if not path.is_file():
         raise ProcessingError(
-            f"Путь к входному CSV не является файлом: {path}"
+            f"Путь к CSV не является файлом: {path}"
         )
     raw = path.read_bytes()[:65536]
     text: str | None = None
@@ -59,7 +59,7 @@ def detect_csv_format(path: Path) -> tuple[str, str]:
         delimiter = ","
     return used_encoding, delimiter
 def inspect_csv(path: Path) -> CsvInspection:
-    """Читает заголовок CSV и определяет количество строк."""
+    """Читает заголовок CSV и определяет число строк."""
     encoding, delimiter = detect_csv_format(path)
     try:
         preview = pd.read_csv(
@@ -93,7 +93,7 @@ def inspect_csv(path: Path) -> CsvInspection:
         encoding=encoding,
     )
 def sha256sum(path: Path) -> str:
-    """Возвращает SHA256 файла."""
+    """Вычисляет SHA256 файла."""
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         for block in iter(
@@ -103,7 +103,7 @@ def sha256sum(path: Path) -> str:
             digest.update(block)
     return digest.hexdigest()
 def median_spacing(points: np.ndarray) -> float:
-    """Оценивает медианное расстояние между соседними точками."""
+    """Вычисляет медианное расстояние до ближайшей точки."""
     if points.ndim != 2 or points.shape[1] != 2:
         raise ProcessingError(
             "Точки должны иметь форму (N, 2)"
@@ -124,49 +124,125 @@ def median_spacing(points: np.ndarray) -> float:
             "между промерами"
         )
     return value
+def triangle_max_edges(
+    points: np.ndarray,
+    faces: np.ndarray,
+) -> np.ndarray:
+    """Возвращает максимальное ребро каждого треугольника."""
+    if len(faces) == 0:
+        return np.empty(
+            0,
+            dtype=np.float64,
+        )
+    result = np.empty(
+        len(faces),
+        dtype=np.float64,
+    )
+    for index, face in enumerate(faces):
+        triangle = points[face]
+        edge_01 = np.linalg.norm(
+            triangle[0] - triangle[1]
+        )
+        edge_12 = np.linalg.norm(
+            triangle[1] - triangle[2]
+        )
+        edge_20 = np.linalg.norm(
+            triangle[2] - triangle[0]
+        )
+        result[index] = max(
+            float(edge_01),
+            float(edge_12),
+            float(edge_20),
+        )
+    return result
 def filter_faces(
     points: np.ndarray,
     faces: np.ndarray,
     max_edge_m: float,
 ) -> np.ndarray:
-    """Удаляет треугольники с чрезмерно длинными ребрами."""
+    """Оставляет треугольники с допустимой длиной ребер."""
+    if not math.isfinite(max_edge_m):
+        raise ProcessingError(
+            "Максимальное ребро TIN должно быть "
+            "конечным числом"
+        )
     if max_edge_m <= 0:
         raise ProcessingError(
-            "Максимальная длина ребра должна быть больше нуля"
+            "Максимальное ребро TIN должно быть "
+            "больше нуля"
         )
-    accepted: list[np.ndarray] = []
-    for face in faces:
-        triangle = points[face]
-        lengths = (
-            float(
-                np.linalg.norm(
-                    triangle[0] - triangle[1]
-                )
-            ),
-            float(
-                np.linalg.norm(
-                    triangle[1] - triangle[2]
-                )
-            ),
-            float(
-                np.linalg.norm(
-                    triangle[2] - triangle[0]
-                )
-            ),
-        )
-        if max(lengths) <= max_edge_m:
-            accepted.append(face)
-    if not accepted:
+    face_max_edges = triangle_max_edges(
+        points,
+        faces,
+    )
+    accepted = faces[
+        face_max_edges <= max_edge_m
+    ]
+    if len(accepted) == 0:
+        if len(face_max_edges) == 0:
+            raise ProcessingError(
+                "Триангуляция не содержит треугольников"
+            )
+        shortest = float(face_max_edges.min())
+        longest = float(face_max_edges.max())
         raise ProcessingError(
             "После ограничения максимального ребра "
-            "не осталось треугольников"
+            "не осталось треугольников. "
+            f"Заданный порог: {max_edge_m:.3f} м; "
+            f"минимальная максимальная сторона "
+            f"треугольника: {shortest:.3f} м; "
+            f"максимальная: {longest:.3f} м. "
+            "Увеличьте параметр "
+            "\"Максимальное ребро TIN\"."
         )
     return np.asarray(
         accepted,
         dtype=np.int64,
     )
+def filter_faces_automatic(
+    points: np.ndarray,
+    faces: np.ndarray,
+    spacing: float,
+) -> tuple[np.ndarray, float]:
+    """
+    Фильтрует треугольники в автоматическом режиме.
+    Сначала используется порог spacing * 4. Если он удаляет
+    все треугольники, порог увеличивается до минимального
+    фактического размера треугольника.
+    """
+    if spacing <= 0:
+        raise ProcessingError(
+            "Расстояние между промерами должно быть "
+            "больше нуля"
+        )
+    proposed_edge = spacing * 4.0
+    try:
+        accepted = filter_faces(
+            points,
+            faces,
+            proposed_edge,
+        )
+        return accepted, proposed_edge
+    except ProcessingError:
+        pass
+    face_max_edges = triangle_max_edges(
+        points,
+        faces,
+    )
+    if len(face_max_edges) == 0:
+        raise ProcessingError(
+            "Триангуляция не содержит треугольников"
+        )
+    shortest_edge = float(face_max_edges.min())
+    fallback_edge = shortest_edge * 1.001
+    accepted = filter_faces(
+        points,
+        faces,
+        fallback_edge,
+    )
+    return accepted, fallback_edge
 def normalize_numeric(series: pd.Series) -> pd.Series:
-    """Преобразует числовые значения CSV в числа."""
+    """Преобразует значения серии в числа."""
     return pd.to_numeric(
         series.astype(str)
         .str.strip()
@@ -181,8 +257,8 @@ def read_and_prepare(
     config: ProcessingConfig,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Читает CSV, проверяет значения, преобразует координаты
-    и агрегирует точки, округленные до сантиметров.
+    Читает CSV, проверяет строки, преобразует координаты
+    и агрегирует совпадающие плановые точки.
     """
     encoding, delimiter = detect_csv_format(
         config.input_csv
@@ -222,8 +298,6 @@ def read_and_prepare(
             + ", ".join(missing)
         )
     quality = source.copy()
-    # Номер строки соответствует номеру строки исходного CSV
-    # с учетом строки заголовка.
     quality["source_row"] = np.arange(
         2,
         len(source) + 2,
@@ -308,11 +382,8 @@ def read_and_prepare(
             "Рабочая система координат должна "
             "быть проекционной"
         )
-    valid_mask = (
-        quality["quality_status"] == "valid"
-    )
     valid_rows = quality.loc[
-        valid_mask
+        quality["quality_status"] == "valid"
     ].copy()
     if len(valid_rows) < 3:
         raise ProcessingError(
@@ -386,8 +457,6 @@ def read_and_prepare(
         ),
         "y_m",
     ] = valid_rows["y_m"].to_numpy()
-    # Округление используется только для поиска
-    # совпадающих плановых точек.
     valid_rows["x_round"] = (
         valid_rows["x_m"].round(2)
     )
@@ -395,7 +464,10 @@ def read_and_prepare(
         valid_rows["y_m"].round(2)
     )
     duplicates = valid_rows.duplicated(
-        subset=["x_round", "y_round"],
+        subset=[
+            "x_round",
+            "y_round",
+        ],
         keep="first",
     )
     duplicate_source_rows = valid_rows.loc[
@@ -420,7 +492,10 @@ def read_and_prepare(
         ]
     aggregated = (
         valid_rows.groupby(
-            ["x_round", "y_round"],
+            [
+                "x_round",
+                "y_round",
+            ],
             as_index=False,
         )
         .agg(
@@ -447,9 +522,13 @@ def write_xyz(
     points: pd.DataFrame,
     path: Path,
 ) -> None:
-    """Записывает точки в XYZ-файл."""
+    """Записывает принятые точки в XYZ."""
     points[
-        ["x_m", "y_m", "depth_m"]
+        [
+            "x_m",
+            "y_m",
+            "depth_m",
+        ]
     ].to_csv(
         path,
         sep=" ",
@@ -457,35 +536,122 @@ def write_xyz(
         header=False,
         float_format="%.4f",
     )
+def _las_scale_and_offset(
+    values: np.ndarray,
+) -> tuple[float, float]:
+    """
+    Рассчитывает масштаб и offset для одной координаты LAS.
+    Координаты LAS хранятся как signed int32. Используется
+    запас 10 процентов, чтобы исключить переполнение при
+    округлении чисел с плавающей точкой.
+    """
+    if values.size == 0:
+        raise ProcessingError(
+            "Нельзя рассчитать параметры LAS "
+            "для пустого массива"
+        )
+    if not np.all(np.isfinite(values)):
+        raise ProcessingError(
+            "Координаты LAS содержат "
+            "нечисловые или бесконечные значения"
+        )
+    int32_limit = float(
+        min(
+            np.iinfo(np.int32).max,
+            abs(np.iinfo(np.int32).min),
+        )
+    )
+    safe_limit = int32_limit * 0.90
+    value_min = float(values.min())
+    value_max = float(values.max())
+    value_span = value_max - value_min
+    # Минимальная точность 1 мм сохраняется для обычных
+    # пространственных охватов.
+    scale = 0.001
+    if value_span > safe_limit * scale:
+        scale = value_span / safe_limit
+    if not math.isfinite(scale) or scale <= 0:
+        raise ProcessingError(
+            "Не удалось рассчитать масштаб координаты LAS"
+        )
+    # Offset равен минимуму координаты. Тогда нижняя точка
+    # хранится около нуля, а весь диапазон помещается в int32.
+    offset = value_min
+    return scale, offset
 def write_las(
     points: pd.DataFrame,
     path: Path,
     output_crs: str,
-) -> None:
-    """Записывает точки в LAS 1.2 с CRS и depth_m."""
+) -> dict[str, list[float]]:
+    """
+    Записывает точки в LAS 1.2.
+    Масштаб и offset рассчитываются отдельно для X, Y и Z.
+    Это предотвращает OverflowError при больших координатах,
+    большом пространственном охвате или отрицательных Z.
+    """
+    x_values = points["x_m"].to_numpy(
+        dtype=np.float64
+    )
+    y_values = points["y_m"].to_numpy(
+        dtype=np.float64
+    )
+    depth_values = points["depth_m"].to_numpy(
+        dtype=np.float64
+    )
+    z_values = -depth_values
+    for name, values in (
+        ("X", x_values),
+        ("Y", y_values),
+        ("Z", z_values),
+    ):
+        if values.size == 0:
+            raise ProcessingError(
+                f"Нет значений координаты {name} "
+                "для записи LAS"
+            )
+        if not np.all(np.isfinite(values)):
+            raise ProcessingError(
+                f"Координата {name} содержит "
+                "нечисловые или бесконечные значения"
+            )
+    x_scale, x_offset = _las_scale_and_offset(
+        x_values
+    )
+    y_scale, y_offset = _las_scale_and_offset(
+        y_values
+    )
+    z_scale, z_offset = _las_scale_and_offset(
+        z_values
+    )
+    scales = np.array(
+        [
+            x_scale,
+            y_scale,
+            z_scale,
+        ],
+        dtype=np.float64,
+    )
+    offsets = np.array(
+        [
+            x_offset,
+            y_offset,
+            z_offset,
+        ],
+        dtype=np.float64,
+    )
     header = laspy.LasHeader(
         point_format=3,
         version="1.2",
     )
-    header.scales = np.array(
-        [0.001, 0.001, 0.001],
-        dtype=np.float64,
-    )
-    header.offsets = np.array(
-        [
-            float(points["x_m"].min()),
-            float(points["y_m"].min()),
-            0.0,
-        ],
-        dtype=np.float64,
-    )
+    header.scales = scales
+    header.offsets = offsets
     try:
         header.add_crs(
             CRS.from_user_input(output_crs)
         )
     except Exception as error:
         raise ProcessingError(
-            f"Не удалось записать CRS в LAS: {error}"
+            f"Не удалось добавить CRS в LAS: {error}"
         ) from error
     header.add_extra_dim(
         laspy.ExtraBytesParams(
@@ -494,28 +660,44 @@ def write_las(
         )
     )
     las = laspy.LasData(header)
-    las.x = points["x_m"].to_numpy()
-    las.y = points["y_m"].to_numpy()
-    las.z = -points["depth_m"].to_numpy()
-    las.depth_m = points[
-        "depth_m"
-    ].to_numpy(
-        dtype=np.float32,
-    )
-    las.intensity = np.clip(
-        points[
-            "beam_distance_m"
-        ].to_numpy()
-        * 1000,
-        0,
-        65535,
-    ).astype(np.uint16)
     try:
+        las.x = x_values
+        las.y = y_values
+        las.z = z_values
+        las.depth_m = depth_values.astype(
+            np.float32
+        )
+        beam_values = points[
+            "beam_distance_m"
+        ].to_numpy(
+            dtype=np.float64
+        )
+        las.intensity = np.clip(
+            beam_values * 1000.0,
+            0,
+            65535,
+        ).astype(np.uint16)
         las.write(path)
+    except OverflowError as error:
+        raise ProcessingError(
+            "Координаты не помещаются в диапазон LAS "
+            "после автоматического выбора масштаба "
+            "и offset"
+        ) from error
     except Exception as error:
         raise ProcessingError(
             f"Не удалось записать LAS-файл: {error}"
         ) from error
+    return {
+        "scales": [
+            float(value)
+            for value in scales
+        ],
+        "offsets": [
+            float(value)
+            for value in offsets
+        ],
+    }
 def write_mesh(
     points: np.ndarray,
     depths: np.ndarray,
@@ -523,10 +705,10 @@ def write_mesh(
     output_dir: Path,
     output_crs: str,
 ) -> None:
-    """Создает локальную OBJ/STL-модель поверхности."""
+    """Создает OBJ и STL локальной поверхности."""
     if len(points) < 3:
         raise ProcessingError(
-            "Недостаточно точек для создания модели"
+            "Недостаточно точек для создания 3D-модели"
         )
     origin_x = float(points[:, 0].min())
     origin_y = float(points[:, 1].min())
@@ -583,7 +765,7 @@ def write_tiff_and_pdf(
     output_dir: Path,
     output_crs: str,
 ) -> None:
-    """Создает интерполированный GeoTIFF и PDF-карту."""
+    """Создает GeoTIFF и PDF-карту."""
     if pixel_size_m <= 0:
         raise ProcessingError(
             "Размер ячейки TIFF должен быть "
@@ -621,7 +803,7 @@ def write_tiff_and_pdf(
     if width * height > 20_000_000:
         raise ProcessingError(
             "Растр слишком большой. "
-            "Увеличьте размер ячейки"
+            "Увеличьте размер ячейки TIFF"
         )
     grid_x = west + (
         np.arange(width) + 0.5
@@ -870,7 +1052,10 @@ def run_pipeline(
         encoding="utf-8-sig",
     )
     xy = points[
-        ["x_m", "y_m"]
+        [
+            "x_m",
+            "y_m",
+        ]
     ].to_numpy(
         dtype=np.float64
     )
@@ -880,16 +1065,6 @@ def run_pipeline(
         dtype=np.float64
     )
     spacing = median_spacing(xy)
-    max_edge = (
-        config.max_triangle_edge_m
-        if config.max_triangle_edge_m is not None
-        else spacing * 4
-    )
-    pixel_size = (
-        config.pixel_size_m
-        if config.pixel_size_m is not None
-        else max(spacing / 2, 0.05)
-    )
     notify("Построение триангуляции")
     try:
         triangulation = Delaunay(xy)
@@ -898,17 +1073,41 @@ def run_pipeline(
             "Не удалось построить поверхность. "
             "Точки могут лежать на одной линии"
         ) from error
-    faces = filter_faces(
-        xy,
-        triangulation.simplices,
-        max_edge,
+    if config.max_triangle_edge_m is None:
+        faces, max_edge = filter_faces_automatic(
+            xy,
+            triangulation.simplices,
+            spacing,
+        )
+        edge_mode = "automatic"
+    else:
+        max_edge = config.max_triangle_edge_m
+        faces = filter_faces(
+            xy,
+            triangulation.simplices,
+            max_edge,
+        )
+        edge_mode = "manual"
+    if config.pixel_size_m is None:
+        pixel_size = max(
+            spacing / 2,
+            0.05,
+        )
+    else:
+        pixel_size = config.pixel_size_m
+    notify(
+        "Триангуляция: "
+        f"{len(triangulation.simplices)} "
+        "треугольников; принято после фильтра: "
+        f"{len(faces)}; максимальное ребро: "
+        f"{max_edge:.3f} м; режим: {edge_mode}"
     )
     notify("Создание XYZ и LAS")
     write_xyz(
         points,
         output_dir / "bottom_points.xyz",
     )
-    write_las(
+    las_info = write_las(
         points,
         output_dir / "bottom_points.las",
         config.output_crs,
@@ -969,12 +1168,21 @@ def run_pipeline(
         "median_spacing_m": spacing,
         "pixel_size_m": pixel_size,
         "max_triangle_edge_m": max_edge,
+        "max_triangle_edge_mode": edge_mode,
+        "triangles_before_filter": int(
+            len(triangulation.simplices)
+        ),
+        "triangles_after_filter": int(
+            len(faces)
+        ),
         "minimum_depth_m": float(
             points["depth_m"].min()
         ),
         "maximum_depth_m": float(
             points["depth_m"].max()
         ),
+        "las_scales": las_info["scales"],
+        "las_offsets": las_info["offsets"],
         "las_z_definition": (
             "z = -depth_m; positive depth is "
             "stored in extra field depth_m"
