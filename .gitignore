@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+.venv-build/
+venv/
+build/
+dist/
+portable_release/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.log
