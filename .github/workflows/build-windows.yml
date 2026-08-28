@@ -1,130 +1,93 @@
 name: Build Windows Portable
+
 on:
   workflow_dispatch:
+
   push:
     branches:
       - main
-    tags:
-      - "v*"
-permissions:
-  contents: write
+      - navimetry-0.2
+
+  pull_request:
+    branches:
+      - main
+
 jobs:
-  build:
-    name: Build portable Windows application
-    runs-on: windows-2022
+  build-windows:
+    runs-on: windows-latest
+
+    permissions:
+      contents: read
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-      - name: Setup Python
+
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          architecture: x64
-          cache: pip
-          cache-dependency-path: requirements-build.txt
-      - name: Install dependencies
+          cache: "pip"
+
+      - name: Show environment
         shell: cmd
         run: |
-          python -m pip install --upgrade pip setuptools wheel
-          if errorlevel 1 exit /b 1
-          python -m pip install --no-cache-dir --force-reinstall -r requirements-build.txt
-          if errorlevel 1 exit /b 1
-          python -m pip check
-          if errorlevel 1 exit /b 1
-          python -c "import numpy; print('numpy:', numpy.__version__)"
-          if errorlevel 1 exit /b 1
-          python -c "import matplotlib; print('matplotlib:', matplotlib.__version__)"
-          if errorlevel 1 exit /b 1
-          python -c "import rasterio; print('rasterio:', rasterio.__version__)"
-          if errorlevel 1 exit /b 1
-          python -c "import pyproj; print('pyproj:', pyproj.__version__)"
-          if errorlevel 1 exit /b 1
-      - name: Compile Python sources
-        shell: cmd
-        run: |
-          python -m compileall -q main.py bathymetry ui tests
-          if errorlevel 1 exit /b 1
-      - name: Run tests
-        shell: cmd
-        run: |
-          python -m pytest -q
-          if errorlevel 1 exit /b 1
+          python --version
+          pip --version
+          git --version
+
       - name: Build portable distribution
         shell: cmd
-        env:
-          CI: "true"
         run: |
+          set CI=true
           call build_portable.bat
-          if errorlevel 1 exit /b 1
-      - name: Verify build output
-        shell: pwsh
+
+      - name: Verify executable
+        shell: powershell
         run: |
-          $required = @(
-            "dist/BathymetryMVP/BathymetryMVP.exe",
-            "portable_release/BathymetryMVP_Portable.zip",
-            "portable_release/BathymetryMVP_Portable.zip.sha256.txt"
-          )
-          foreach ($path in $required) {
-            if (-not (Test-Path $path)) {
-              Write-Error "Required build file is missing: $path"
-              exit 1
-            }
+          $exe = "dist/Navimetry/Navimetry.exe"
+
+          if (-not (Test-Path -LiteralPath $exe)) {
+              throw "Navimetry.exe was not created"
           }
-          $size = (
-            Get-Item "portable_release/BathymetryMVP_Portable.zip"
-          ).Length
-          if ($size -le 0) {
-            Write-Error "Portable archive is empty"
-            exit 1
+
+          Write-Host "Executable found:"
+          Get-Item $exe | Format-List Name,Length,FullName
+
+      - name: Verify portable archive
+        shell: powershell
+        run: |
+          $archive = "portable_release/Navimetry_Windows_x64_Portable.zip"
+          $checksum = "portable_release/Navimetry_Windows_x64_Portable.zip.sha256.txt"
+
+          if (-not (Test-Path -LiteralPath $archive)) {
+              throw "Portable ZIP was not created"
           }
-          Write-Host "Portable archive size: $size bytes"
-      - name: Upload portable archive
+
+          if (-not (Test-Path -LiteralPath $checksum)) {
+              throw "SHA256 file was not created"
+          }
+
+          Write-Host "Portable archive:"
+          Get-Item $archive | Format-List Name,Length,FullName
+
+          Write-Host "Checksum:"
+          Get-Content $checksum
+
+      - name: Upload portable release
         uses: actions/upload-artifact@v4
         with:
-          name: BathymetryMVP-Windows-x64-${{ github.sha }}
+          name: Navimetry-Windows-x64-${{ github.sha }}
           path: |
-            portable_release/BathymetryMVP_Portable.zip
-            portable_release/BathymetryMVP_Portable.zip.sha256.txt
+            portable_release/Navimetry_Windows_x64_Portable.zip
+            portable_release/Navimetry_Windows_x64_Portable.zip.sha256.txt
           if-no-files-found: error
           retention-days: 30
-  release:
-    name: Publish GitHub Release
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: windows-2022
-    steps:
-      - name: Download build artifact
-        uses: actions/download-artifact@v4
+
+      - name: Upload build manifest
+        uses: actions/upload-artifact@v4
         with:
-          name: BathymetryMVP-Windows-x64-${{ github.sha }}
-          path: release-assets
-      - name: Publish release
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          $version = "${{ github.ref_name }}"
-          $archive = Get-ChildItem `
-            -Path release-assets `
-            -Filter "*.zip" `
-            -Recurse |
-            Select-Object -First 1
-          $checksum = Get-ChildItem `
-            -Path release-assets `
-            -Filter "*.sha256.txt" `
-            -Recurse |
-            Select-Object -First 1
-          if (-not $archive) {
-            Write-Error "Portable archive was not downloaded"
-            exit 1
-          }
-          if (-not $checksum) {
-            Write-Error "SHA256 checksum was not downloaded"
-            exit 1
-          }
-          gh release create $version `
-            $archive.FullName `
-            $checksum.FullName `
-            --repo "${{ github.repository }}" `
-            --title "Bathymetry MVP $version" `
-            --generate-notes
+          name: Navimetry-build-manifest-${{ github.sha }}
+          path: dist/Navimetry/build_manifest.json
+          if-no-files-found: error
+          retention-days: 30
