@@ -12,6 +12,9 @@ class SurveyPreset:
     strict_edge_factor: float
     presentation_radius_factor: float
     minimum_presentation_radius_m: float
+    strict_cross_track_factor: float = 1.35
+    strict_along_track_factor: float = 2.00
+    cross_line_threshold_factor: float = 0.25
     prefer_estimated_line_spacing: bool = True
     requires_georeferenced_swath_points: bool = False
     description: str = ""
@@ -26,6 +29,8 @@ SURVEY_PRESETS: dict[str, SurveyPreset] = {
         strict_edge_factor=1.35,
         presentation_radius_factor=0.75,
         minimum_presentation_radius_m=0.50,
+        strict_cross_track_factor=1.35,
+        strict_along_track_factor=2.00,
         description="Estimate survey-line spacing from ordered accepted observations and derive surface thresholds from that geometry.",
     ),
     "SINGLE_BEAM_DENSE": SurveyPreset(
@@ -36,6 +41,8 @@ SURVEY_PRESETS: dict[str, SurveyPreset] = {
         strict_edge_factor=1.30,
         presentation_radius_factor=0.70,
         minimum_presentation_radius_m=0.50,
+        strict_cross_track_factor=1.30,
+        strict_along_track_factor=1.75,
         description="Dense single-beam geometry. Estimated spacing is preferred; 2 m is only a fallback assumption when estimation is unavailable.",
     ),
     "SINGLE_BEAM_NORMAL": SurveyPreset(
@@ -46,6 +53,8 @@ SURVEY_PRESETS: dict[str, SurveyPreset] = {
         strict_edge_factor=1.35,
         presentation_radius_factor=0.75,
         minimum_presentation_radius_m=0.75,
+        strict_cross_track_factor=1.35,
+        strict_along_track_factor=2.00,
         description="General single-beam geometry. Estimated spacing is preferred; 5 m is only a fallback assumption when estimation is unavailable.",
     ),
     "WIDE_SPACING": SurveyPreset(
@@ -56,6 +65,8 @@ SURVEY_PRESETS: dict[str, SurveyPreset] = {
         strict_edge_factor=1.25,
         presentation_radius_factor=0.65,
         minimum_presentation_radius_m=1.0,
+        strict_cross_track_factor=1.25,
+        strict_along_track_factor=1.50,
         description="Sparse reconnaissance geometry with more conservative relative bridging. Estimated spacing is preferred; 10 m is a fallback assumption.",
     ),
     "MANUAL": SurveyPreset(
@@ -66,6 +77,8 @@ SURVEY_PRESETS: dict[str, SurveyPreset] = {
         strict_edge_factor=1.35,
         presentation_radius_factor=0.75,
         minimum_presentation_radius_m=0.50,
+        strict_cross_track_factor=1.35,
+        strict_along_track_factor=2.00,
         prefer_estimated_line_spacing=False,
         description="Use an explicit expected line spacing and/or explicit triangle-edge and presentation-radius overrides.",
     ),
@@ -77,6 +90,8 @@ SURVEY_PRESETS: dict[str, SurveyPreset] = {
         strict_edge_factor=1.20,
         presentation_radius_factor=0.60,
         minimum_presentation_radius_m=0.50,
+        strict_cross_track_factor=1.20,
+        strict_along_track_factor=1.50,
         requires_georeferenced_swath_points=True,
         description="Reserved for georeferenced across-track/swath bottom observations. Vessel-centerline Beam distance alone cannot reconstruct port/starboard swath geometry.",
     ),
@@ -95,7 +110,7 @@ def preset_metadata(key: str | None) -> dict:
 
 
 def resolve_surface_geometry(config, preset: SurveyPreset, track_geometry: dict) -> dict:
-    """Resolve effective survey spacing and derived gridding thresholds with explicit provenance."""
+    """Resolve effective survey spacing and derived gridding/QC thresholds with explicit provenance."""
     estimated=track_geometry.get("estimated_line_spacing_m") if track_geometry else None
     if config.expected_line_spacing_m is not None:
         spacing=float(config.expected_line_spacing_m)
@@ -132,4 +147,9 @@ def resolve_surface_geometry(config, preset: SurveyPreset, track_geometry: dict)
         "presentation_radius_m": presentation_radius,
         "presentation_radius_source": presentation_radius_source,
         "preset_key": preset.key,
+        "geometry": preset.geometry,
+        "strict_cross_track_factor": float(preset.strict_cross_track_factor),
+        "strict_along_track_factor": float(preset.strict_along_track_factor),
+        "cross_line_threshold_factor": float(preset.cross_line_threshold_factor),
+        "survey_aware_triangle_qc": True,
     }
