@@ -23,6 +23,7 @@ def run_self_test() -> int:
         from bathymetry.processor import run_pipeline, build_local_delaunay  # noqa: F401
         from bathymetry.survey_presets import get_survey_preset, resolve_surface_geometry  # noqa: F401
         from bathymetry.survey_geometry import estimate_track_geometry  # noqa: F401
+        from bathymetry.survey_triangle_qc import evaluate_triangles  # noqa: F401
         import numpy  # noqa: F401
         import pandas  # noqa: F401
         import scipy  # noqa: F401
