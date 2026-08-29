@@ -1,4 +1,5 @@
 from pathlib import Path
+import numpy as np
 import pandas as pd
 import rasterio
 from bathymetry.models import ProcessingConfig
@@ -41,11 +42,23 @@ def test_pipeline_creates_v02_products(tmp_path: Path) -> None:
     required=[
         "normalized_observations.csv","accepted_points.csv","suspect_points.csv","rejected_points.csv",
         "bottom_points.xyz","bottom_points.las","depth_surface.obj","depth_surface.stl",
-        "bathymetry_depth.tiff","coverage_mask.tiff","nearest_point_distance.tiff","support_quality.tiff",
-        "triangle_quality.csv","processing_report.json","processing_report.pdf","project.navimetry.sqlite","manifest.json",
+        "bathymetry_depth.tiff","bathymetry_depth_strict.tiff","coverage_mask.tiff","presentation_mask.tiff",
+        "nearest_point_distance.tiff","support_quality.tiff","triangle_quality.csv","processing_report.json",
+        "processing_report.pdf","project.navimetry.sqlite","manifest.json",
     ]
     for name in required: assert (output_dir/name).exists(), name
     with rasterio.open(output_dir/"bathymetry_depth.tiff") as ds:
+        presentation=ds.read(1)
         assert ds.crs is not None and ds.nodata == -9999.0
+    with rasterio.open(output_dir/"bathymetry_depth_strict.tiff") as ds:
+        strict=ds.read(1)
+    with rasterio.open(output_dir/"coverage_mask.tiff") as ds:
+        strict_mask=ds.read(1).astype(bool)
+    with rasterio.open(output_dir/"presentation_mask.tiff") as ds:
+        presentation_mask=ds.read(1).astype(bool)
+    assert np.all(~strict_mask | presentation_mask)
+    assert np.count_nonzero(presentation != -9999.0) >= np.count_nonzero(strict != -9999.0)
+    assert result["surface"]["surface_qc_version"] == "2"
+    assert result["surface"]["presentation_grid_is_quality_evidence"] is False
     report=result
     assert report["classification"]["primary_depth_source"] == "KOGGERAPP_BEAM"
