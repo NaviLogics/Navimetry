@@ -29,6 +29,8 @@ def run_self_test() -> int:
         import laspy  # noqa: F401
         import trimesh  # noqa: F401
         import PySide6  # noqa: F401
+        import matplotlib.backends.backend_agg  # noqa: F401
+        import matplotlib.backends.backend_pdf  # noqa: F401
 
         report_path.write_text("Navimetry self-test passed\n", encoding="utf-8")
         return 0
