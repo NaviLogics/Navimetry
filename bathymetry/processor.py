@@ -158,47 +158,84 @@ def _write_raster(path: Path, array: np.ndarray, transform, crs: str, nodata, dt
 
 def write_surface_products(points: pd.DataFrame, triangulation: Delaunay, accepted_faces: np.ndarray,
                            pixel_size: float, output_dir: Path, output_crs: str,
-                           config: ProcessingConfig) -> dict:
+                           config: ProcessingConfig, spacing: float) -> dict:
+    """Surface QC v2: strict evidence plus a separately labelled presentation grid."""
     x=points["x_m"].to_numpy(float); y=points["y_m"].to_numpy(float); depth=points["depth_primary_m"].to_numpy(float)
     west,east,south,north=float(x.min()),float(x.max()),float(y.min()),float(y.max())
     width=max(1,int(math.ceil((east-west)/pixel_size))); height=max(1,int(math.ceil((north-south)/pixel_size)))
     if width*height>20_000_000: raise ProcessingError("Raster too large; increase pixel size")
     gx=west+(np.arange(width)+0.5)*pixel_size; gy=north-(np.arange(height)+0.5)*pixel_size
     mx,my=np.meshgrid(gx,gy); grid=np.column_stack((mx.ravel(),my.ravel()))
+
+    # One linear interpolator is used for both products. The difference is only the support mask.
     interp=LinearNDInterpolator(triangulation,depth,fill_value=np.nan)
-    values=np.asarray(interp(grid),float)
+    full_values=np.asarray(interp(grid),float)
     simplex=triangulation.find_simplex(grid)
+    inside_hull=simplex >= 0
+
+    # Strict engineering coverage: only cells in triangles that passed triangle QC.
     allowed=set(int(i) for i in accepted_faces.tolist())
-    support=np.array([(sid in allowed) for sid in simplex],dtype=bool)
-    values[~support]=np.nan
-    raster=values.reshape(height,width)
-    support_raster=support.reshape(height,width)
+    strict_support=np.array([(sid in allowed) for sid in simplex],dtype=bool)
+    strict_values=full_values.copy(); strict_values[~strict_support]=np.nan
+    strict_raster=strict_values.reshape(height,width)
+    strict_mask=strict_support.reshape(height,width)
+
+    # Presentation grid: still no extrapolation outside the Delaunay hull, and every cell is
+    # constrained by distance to an actually accepted surface observation. This is deliberately
+    # broader than strict coverage, but it is not promoted to measurement-quality evidence.
     tree=cKDTree(np.column_stack((x,y)))
     nearest=tree.query(grid,k=1)[0].reshape(height,width)
-    transform=from_origin(west,north,pixel_size,pixel_size)
-    _write_raster(output_dir/"bathymetry_depth.tiff", np.where(np.isfinite(raster),raster,-9999.0), transform, output_crs,-9999.0,"float32",
-                  "Primary depth, m", {"units":"m","depth_direction":"positive_down","depth_source":"KOGGERAPP_BEAM","vertical_datum":"unknown"})
-    _write_raster(output_dir/"coverage_mask.tiff", support_raster.astype(np.uint8), transform, output_crs,0,"uint8",
-                  "Surface support mask", {"meaning":"1=supported_by_accepted_TIN_triangle,0=unsupported"})
-    _write_raster(output_dir/"nearest_point_distance.tiff", nearest.astype(np.float32), transform, output_crs,-9999.0,"float32",
-                  "Distance to nearest accepted observation, m", {"units":"m"})
-    if config.generate_quality_proxy:
-        scale=max(float(np.nanmedian(nearest[support_raster])) if support_raster.any() else pixel_size, pixel_size)
-        proxy=np.where(support_raster, np.clip(nearest/(scale*4.0),0,1), 1.0).astype(np.float32)
-        _write_raster(output_dir/"support_quality.tiff",proxy,transform,output_crs,-9999.0,"float32",
-                      "Support quality proxy (0 best, 1 worst)", {"not_metrological_uncertainty":"true"})
+    nearest_flat=nearest.ravel()
+    if config.max_nearest_point_distance_m is not None:
+        presentation_radius=float(config.max_nearest_point_distance_m)
+        radius_mode="manual"
+    else:
+        presentation_radius=float(min(5.0,max(1.5,spacing*8.0)))
+        radius_mode="automatic_8x_median_spacing_clamped_1.5_to_5m"
+    presentation_support=inside_hull & (nearest_flat <= presentation_radius)
+    presentation_values=full_values.copy(); presentation_values[~presentation_support]=np.nan
+    presentation_raster=presentation_values.reshape(height,width)
+    presentation_mask=presentation_support.reshape(height,width)
 
+    transform=from_origin(west,north,pixel_size,pixel_size)
+    common_tags={"units":"m","depth_direction":"positive_down","depth_source":"KOGGERAPP_BEAM","vertical_datum":"unknown"}
+    _write_raster(output_dir/"bathymetry_depth_strict.tiff",np.where(np.isfinite(strict_raster),strict_raster,-9999.0),transform,output_crs,-9999.0,"float32",
+                  "Primary depth, strict triangle-QC support",{**common_tags,"surface_role":"strict_engineering_evidence"})
+    _write_raster(output_dir/"bathymetry_depth.tiff",np.where(np.isfinite(presentation_raster),presentation_raster,-9999.0),transform,output_crs,-9999.0,"float32",
+                  "Primary depth, presentation grid",{**common_tags,"surface_role":"presentation_only","quality_warning":"Use coverage_mask.tiff and bathymetry_depth_strict.tiff for strict support evidence"})
+    _write_raster(output_dir/"coverage_mask.tiff",strict_mask.astype(np.uint8),transform,output_crs,0,"uint8",
+                  "Strict surface support mask",{"meaning":"1=supported_by_triangle_that_passed_strict_QC,0=not_strictly_supported"})
+    _write_raster(output_dir/"presentation_mask.tiff",presentation_mask.astype(np.uint8),transform,output_crs,0,"uint8",
+                  "Presentation grid support mask",{"meaning":"1=inside_Delaunay_hull_and_within_nearest_point_radius","radius_m":f"{presentation_radius:.6f}","not_quality_evidence":"true"})
+    _write_raster(output_dir/"nearest_point_distance.tiff",nearest.astype(np.float32),transform,output_crs,-9999.0,"float32",
+                  "Distance to nearest accepted observation, m",{"units":"m"})
+    if config.generate_quality_proxy:
+        proxy=np.where(presentation_mask,np.clip(nearest/max(presentation_radius,1e-9),0,1),1.0).astype(np.float32)
+        _write_raster(output_dir/"support_quality.tiff",proxy,transform,output_crs,-9999.0,"float32",
+                      "Support distance proxy (0 best, 1 worst)",{"not_metrological_uncertainty":"true","reference_radius_m":f"{presentation_radius:.6f}"})
+
+    # Presentation PDF: raster is primary. Strict engineering support is outlined separately.
     fig,ax=plt.subplots(figsize=(11.69,8.27))
-    im=ax.imshow(raster,extent=(west,east,south,north),origin="upper",aspect="equal")
-    ax.scatter(x,y,s=1,alpha=0.25,label="Accepted observations")
+    im=ax.imshow(presentation_raster,extent=(west,east,south,north),origin="upper",aspect="equal")
+    if strict_mask.any() and not strict_mask.all():
+        ax.contour(gx,gy[::-1],strict_mask.astype(np.uint8),levels=[0.5],linewidths=0.7)
     fig.colorbar(im,ax=ax,shrink=.8,label="Depth, m")
-    ax.set_title("Navimetry 0.2 bathymetry — KoggerApp Beam distance")
-    ax.set_xlabel("X, m"); ax.set_ylabel("Y, m"); ax.legend(loc="upper right")
-    ax.text(.01,.01,f"CRS: {output_crs}\nDepth source: KOGGERAPP_BEAM\nVertical datum: unknown\nPixel: {pixel_size:.3f} m",
+    ax.set_title("Navimetry 0.2 Surface QC v2 — presentation bathymetric grid")
+    ax.set_xlabel("X, m"); ax.set_ylabel("Y, m")
+    ax.text(.01,.01,
+            f"CRS: {output_crs}\nDepth source: KOGGERAPP_BEAM\nVertical datum: unknown\nPixel: {pixel_size:.3f} m\nPresentation radius: {presentation_radius:.2f} m\nStrict coverage outline: triangle QC",
             transform=ax.transAxes,fontsize=8,va="bottom",bbox={"facecolor":"white","alpha":.8,"edgecolor":"gray"})
     fig.tight_layout(); fig.savefig(output_dir/"processing_report.pdf",dpi=180); plt.close(fig)
     shutil.copy2(output_dir/"processing_report.pdf", output_dir/"bathymetry_map.pdf")
-    return {"width":width,"height":height,"pixel_size_m":pixel_size,"supported_cells":int(support_raster.sum())}
+    return {
+        "surface_qc_version":"2",
+        "width":width,"height":height,"pixel_size_m":pixel_size,
+        "strict_supported_cells":int(strict_mask.sum()),
+        "presentation_supported_cells":int(presentation_mask.sum()),
+        "presentation_radius_m":presentation_radius,
+        "presentation_radius_mode":radius_mode,
+        "presentation_grid_is_quality_evidence":False,
+    }
 
 
 def _store_project_database(db_path: Path, csv_result, klf_result, observations: pd.DataFrame,
@@ -299,8 +336,8 @@ def run_pipeline(config: ProcessingConfig, progress: Callable[[str],None] | None
     write_xyz(surface_points,config.output_dir/"bottom_points.xyz")
     las_info=write_las(surface_points,config.output_dir/"bottom_points.las",config.output_crs)
     write_mesh(xy,depths,faces,config.output_dir,config.output_crs)
-    notify("Write depth/coverage/support GeoTIFF and PDF")
-    raster_info=write_surface_products(surface_points,tri,accepted_indices,pixel,config.output_dir,config.output_crs,config)
+    notify("Write Surface QC v2 strict/presentation GeoTIFF and PDF")
+    raster_info=write_surface_products(surface_points,tri,accepted_indices,pixel,config.output_dir,config.output_crs,config,spacing)
 
     klf_inv=asdict(klf_result.inventory) if klf_result is not None else None
     report={
@@ -333,6 +370,8 @@ def run_pipeline(config: ProcessingConfig, progress: Callable[[str],None] | None
         "warnings":[
             "Beam distance is treated as KoggerApp-derived primary depth and is not automatically offset by transducer draft.",
             "Bottom elevation is unavailable because vertical datum/reduction is not established.",
+            "Surface QC v2 bathymetry_depth.tiff is a presentation grid; strict engineering evidence remains bathymetry_depth_strict.tiff plus coverage_mask.tiff.",
+            "Presentation interpolation is limited to the Delaunay hull and nearest-observation radius, but is not metrological uncertainty or strict coverage evidence.",
             "Support quality is not a metrological uncertainty surface.",
             "Direct UM982 stream is not inferred from GPS_RAW_INT.",
         ],
