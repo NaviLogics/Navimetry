@@ -40,6 +40,7 @@ hiddenimports += [
     "PySide6.QtGui",
     "PySide6.QtWidgets",
     "matplotlib.backends.backend_agg",
+    "matplotlib.backends.backend_pdf",
     "scipy.spatial._qhull",
 ]
 
