@@ -33,6 +33,7 @@ from bathymetry.quality_control import normalize_observations, build_surface_poi
 from bathymetry.project_store import initialize_database, store_dataframe
 from bathymetry.survey_geometry import estimate_track_geometry
 from bathymetry.survey_presets import get_survey_preset, preset_metadata, resolve_surface_geometry
+from bathymetry.survey_triangle_qc import evaluate_triangles
 
 
 class ProcessingError(Exception):
@@ -96,14 +97,13 @@ def triangle_metrics(xy: np.ndarray, depth: np.ndarray, faces: np.ndarray) -> pd
 
 
 def filter_triangles(metrics: pd.DataFrame, config: ProcessingConfig, point_spacing: float, effective_geometry: dict) -> tuple[np.ndarray,dict]:
+    """Compatibility isotropic QC helper. Production pipeline uses survey_triangle_qc.evaluate_triangles."""
     if metrics.empty:
         raise ProcessingError("Triangulation contains no triangles")
     derived=effective_geometry.get("strict_max_triangle_edge_m")
     if derived is not None:
         edge_limit=float(derived); edge_mode=str(effective_geometry.get("strict_max_triangle_edge_source","survey_geometry"))
     else:
-        # Geometry estimation can fail on irregular/non-line surveys. Do not fall back to the along-track
-        # nearest-neighbour scale; use a clearly labelled distribution fallback instead.
         edge_limit=max(0.25,float(metrics["max_edge_m"].quantile(0.75)))
         edge_mode="fallback_triangle_distribution_q75"
     mask=(metrics["max_edge_m"].le(edge_limit)
@@ -116,7 +116,7 @@ def filter_triangles(metrics: pd.DataFrame, config: ProcessingConfig, point_spac
     accepted_indices=metrics.loc[mask,"triangle_index"].to_numpy(dtype=np.int64)
     if len(accepted_indices)==0:
         raise ProcessingError("Triangle QC rejected all triangles; review survey geometry or manual thresholds")
-    return accepted_indices,{"max_triangle_edge_m":float(edge_limit),"max_triangle_edge_mode":edge_mode}
+    return accepted_indices,{"max_triangle_edge_m":float(edge_limit),"max_triangle_edge_mode":edge_mode,"triangle_qc_mode":"legacy_isotropic_compatibility"}
 
 
 def _las_scale_and_offset(values: np.ndarray) -> tuple[float,float]:
@@ -182,7 +182,7 @@ def _write_raster(path: Path,array: np.ndarray,transform,crs: str,nodata,dtype: 
 
 def write_surface_products(points: pd.DataFrame,triangulation: Delaunay,local_xy: np.ndarray,local_origin: np.ndarray,accepted_faces: np.ndarray,
                            pixel_size: float,output_dir: Path,output_crs: str,config: ProcessingConfig,point_spacing: float,effective_geometry: dict) -> dict:
-    """Surface QC v4: local interpolation with track-derived survey geometry."""
+    """Surface QC v5: local interpolation with survey-aware anisotropic strict support."""
     x=points["x_m"].to_numpy(float); y=points["y_m"].to_numpy(float); depth=points["depth_primary_m"].to_numpy(float)
     west,east,south,north=float(x.min()),float(x.max()),float(y.min()),float(y.max())
     width=max(1,int(math.ceil((east-west)/pixel_size))); height=max(1,int(math.ceil((north-south)/pixel_size)))
@@ -204,9 +204,9 @@ def write_surface_products(points: pd.DataFrame,triangulation: Delaunay,local_xy
     presentation_values=full_values.copy(); presentation_values[~presentation_support]=np.nan
     presentation_raster=presentation_values.reshape(height,width); presentation_mask=presentation_support.reshape(height,width)
     transform=from_origin(west,north,pixel_size,pixel_size); common={"units":"m","depth_direction":"positive_down","depth_source":"KOGGERAPP_BEAM","vertical_datum":"unknown"}
-    _write_raster(output_dir/"bathymetry_depth_strict.tiff",np.where(np.isfinite(strict_raster),strict_raster,-9999.0),transform,output_crs,-9999.0,"float32","Primary depth, strict triangle-QC support",{**common,"surface_role":"strict_engineering_evidence"})
+    _write_raster(output_dir/"bathymetry_depth_strict.tiff",np.where(np.isfinite(strict_raster),strict_raster,-9999.0),transform,output_crs,-9999.0,"float32","Primary depth, strict survey-aware triangle-QC support",{**common,"surface_role":"strict_engineering_evidence"})
     _write_raster(output_dir/"bathymetry_depth.tiff",np.where(np.isfinite(presentation_raster),presentation_raster,-9999.0),transform,output_crs,-9999.0,"float32","Primary depth, presentation grid",{**common,"surface_role":"presentation_only","quality_warning":"Use strict products for engineering support evidence"})
-    _write_raster(output_dir/"coverage_mask.tiff",strict_mask.astype(np.uint8),transform,output_crs,0,"uint8","Strict surface support mask",{"meaning":"1=supported_by_triangle_that_passed_strict_QC,0=not_strictly_supported"})
+    _write_raster(output_dir/"coverage_mask.tiff",strict_mask.astype(np.uint8),transform,output_crs,0,"uint8","Strict surface support mask",{"meaning":"1=supported_by_triangle_that_passed_survey_aware_strict_QC,0=not_strictly_supported"})
     _write_raster(output_dir/"presentation_mask.tiff",presentation_mask.astype(np.uint8),transform,output_crs,0,"uint8","Presentation grid support mask",{"meaning":"1=inside_Delaunay_hull_and_within_radius_or_strict_support","radius_m":f"{radius:.6f}","not_quality_evidence":"true"})
     _write_raster(output_dir/"nearest_point_distance.tiff",nearest.astype(np.float32),transform,output_crs,-9999.0,"float32","Distance to nearest accepted observation, m",{"units":"m"})
     if config.generate_quality_proxy:
@@ -215,11 +215,11 @@ def write_surface_products(points: pd.DataFrame,triangulation: Delaunay,local_xy
     presentation_mesh=write_presentation_grid_mesh(presentation_raster,west,north,pixel_size,output_dir,output_crs)
     fig,ax=plt.subplots(figsize=(11.69,8.27)); im=ax.imshow(presentation_raster,extent=(west,east,south,north),origin="upper",aspect="equal")
     if strict_mask.any() and not strict_mask.all(): ax.contour(gx,gy[::-1],strict_mask.astype(np.uint8),levels=[0.5],linewidths=0.7)
-    fig.colorbar(im,ax=ax,shrink=.8,label="Depth, m"); ax.set_title("Navimetry 0.2 Surface QC v4 — survey-geometry presentation grid"); ax.set_xlabel("X, m"); ax.set_ylabel("Y, m")
+    fig.colorbar(im,ax=ax,shrink=.8,label="Depth, m"); ax.set_title("Navimetry 0.2 Surface QC v5 — survey-aware bathymetric grid"); ax.set_xlabel("X, m"); ax.set_ylabel("Y, m")
     line_spacing=effective_geometry.get("effective_line_spacing_m"); line_text="unavailable" if line_spacing is None else f"{line_spacing:.2f} m"
-    ax.text(.01,.01,f"CRS: {output_crs}\nDepth source: KOGGERAPP_BEAM\nVertical datum: unknown\nPixel: {pixel_size:.3f} m\nEffective line spacing: {line_text}\nPresentation radius: {radius:.2f} m\nStrict coverage outline: triangle QC",transform=ax.transAxes,fontsize=8,va="bottom",bbox={"facecolor":"white","alpha":.8,"edgecolor":"gray"})
+    ax.text(.01,.01,f"CRS: {output_crs}\nDepth source: KOGGERAPP_BEAM\nVertical datum: unknown\nPixel: {pixel_size:.3f} m\nEffective line spacing: {line_text}\nPresentation radius: {radius:.2f} m\nStrict coverage: survey-aware triangle QC",transform=ax.transAxes,fontsize=8,va="bottom",bbox={"facecolor":"white","alpha":.8,"edgecolor":"gray"})
     fig.tight_layout(); fig.savefig(output_dir/"processing_report.pdf",dpi=180); plt.close(fig); shutil.copy2(output_dir/"processing_report.pdf",output_dir/"bathymetry_map.pdf")
-    return {"surface_qc_version":"4","width":width,"height":height,"pixel_size_m":pixel_size,"strict_supported_cells":int(strict_mask.sum()),
+    return {"surface_qc_version":"5","width":width,"height":height,"pixel_size_m":pixel_size,"strict_supported_cells":int(strict_mask.sum()),
             "presentation_supported_cells":int(presentation_mask.sum()),"presentation_radius_m":radius,"presentation_radius_mode":radius_mode,
             "presentation_grid_is_quality_evidence":False,"presentation_mesh":presentation_mesh}
 
@@ -282,16 +282,22 @@ def run_pipeline(config: ProcessingConfig,progress: Callable[[str],None]|None=No
     effective_geometry=resolve_surface_geometry(config,preset,track_geometry)
 
     xy=surface_points[["x_m","y_m"]].to_numpy(float); depths=surface_points["depth_primary_m"].to_numpy(float); point_spacing=median_spacing(xy)
-    notify("Build local-coordinate Delaunay and triangle QC"); tri,local_xy,local_origin,delaunay_info=build_local_delaunay(xy); tm=triangle_metrics(local_xy,depths,tri.simplices)
-    accepted_indices,triangle_config=filter_triangles(tm,config,point_spacing,effective_geometry); tm.to_csv(config.output_dir/"triangle_quality.csv",index=False,encoding="utf-8-sig"); faces=tri.simplices[accepted_indices]
-    if effective_geometry.get("strict_max_triangle_edge_m") is None:
+    notify("Build local-coordinate Delaunay and survey-aware triangle QC")
+    tri,local_xy,local_origin,delaunay_info=build_local_delaunay(xy); tm=triangle_metrics(local_xy,depths,tri.simplices)
+    try:
+        accepted_indices,triangle_config=evaluate_triangles(tm,local_xy,tri.simplices,config,point_spacing,effective_geometry,track_geometry)
+    except ValueError as error:
+        raise ProcessingError(str(error)) from error
+    tm.to_csv(config.output_dir/"triangle_quality.csv",index=False,encoding="utf-8-sig"); faces=tri.simplices[accepted_indices]
+    if effective_geometry.get("strict_max_triangle_edge_m") is None and triangle_config.get("max_triangle_edge_m") is not None:
         effective_geometry["strict_max_triangle_edge_m"]=triangle_config["max_triangle_edge_m"]; effective_geometry["strict_max_triangle_edge_source"]=triangle_config["max_triangle_edge_mode"]
     if effective_geometry.get("presentation_radius_m") is None:
-        effective_geometry["presentation_radius_m"]=max(1.0,triangle_config["max_triangle_edge_m"]*0.75); effective_geometry["presentation_radius_source"]="fallback_from_strict_edge"
+        fallback_edge=effective_geometry.get("strict_max_triangle_edge_m") or float(tm["max_edge_m"].quantile(0.75))
+        effective_geometry["presentation_radius_m"]=max(1.0,float(fallback_edge)*0.75); effective_geometry["presentation_radius_source"]="fallback_from_strict_edge"
 
     pixel=config.pixel_size_m if config.pixel_size_m is not None else max(point_spacing/2.0,0.05)
     notify("Write XYZ, LAS, strict OBJ/STL"); write_xyz(surface_points,config.output_dir/"bottom_points.xyz"); las_info=write_las(surface_points,config.output_dir/"bottom_points.las",config.output_crs); strict_mesh_info=write_strict_mesh(xy,depths,faces,config.output_dir,config.output_crs,local_origin)
-    notify("Write Surface QC v4 strict/presentation GeoTIFF, presentation OBJ/STL and PDF"); raster_info=write_surface_products(surface_points,tri,local_xy,local_origin,accepted_indices,pixel,config.output_dir,config.output_crs,config,point_spacing,effective_geometry)
+    notify("Write Surface QC v5 strict/presentation GeoTIFF, presentation OBJ/STL and PDF"); raster_info=write_surface_products(surface_points,tri,local_xy,local_origin,accepted_indices,pixel,config.output_dir,config.output_crs,config,point_spacing,effective_geometry)
 
     klf_inv=asdict(klf_result.inventory) if klf_result is not None else None
     report={
@@ -300,9 +306,9 @@ def run_pipeline(config: ProcessingConfig,progress: Callable[[str],None]|None=No
         "survey_geometry":{"version":"1","selected_preset":preset_metadata(config.survey_preset),"configured_geometry":config.survey_geometry,"track_estimation":track_geometry,"effective":effective_geometry,"swath_half_width_m":config.swath_half_width_m,"has_georeferenced_swath_points":config.has_georeferenced_swath_points,"preset_values_are_accuracy_claims":False},
         "source_semantics":{"Beam distance":"KoggerApp-derived primary depth","Rangefinder":"validation only; unavailable when disabled/not recorded","GLOBAL_POSITION_INT":"PX4 estimated global position","GPS_RAW_INT":"raw GNSS evidence through PX4 MAVLink","ATTITUDE":"PX4 estimated attitude","ID_CHART":"raw sonar acoustic chart fragments"},
         "qc":{"normalized_rows":int(len(observations)),"surface_eligible_rows":int(len(accepted)),"rejected_for_surface_rows":int(len(rejected)),"suspect_rows":int(len(suspect)),"zero_coordinate_rows":int(((observations.latitude_raw_deg==0)&(observations.longitude_raw_deg==0)).sum()),"beam_valid_rows":int(observations.depth_primary_m.notna().sum()),"beam_missing_rows":int(observations.depth_primary_m.isna().sum()),"rangefinder_available_rows":int(observations.rangefinder_available.sum())},
-        "surface":{"working_unique_xy_points":int(len(surface_points)),"median_nearest_point_spacing_m":point_spacing,"triangles_before_qc":int(len(tri.simplices)),"triangles_after_qc":int(len(faces)),"delaunay":delaunay_info,"strict_mesh":strict_mesh_info,**triangle_config,**raster_info},
+        "surface":{"working_unique_xy_points":int(len(surface_points)),"median_nearest_point_spacing_m":point_spacing,"triangles_before_qc":int(len(tri.simplices)),"triangles_after_qc":int(len(faces)),"delaunay":delaunay_info,"strict_mesh":strict_mesh_info,"triangle_qc":triangle_config,**raster_info},
         "las":{"z_definition":"z = -depth_primary_m","intensity_semantics":"unused; left zero","extra_bytes":["depth_m","beam_distance_m","quality_code","source_id"],**las_info},
-        "warnings":["Beam distance is treated as KoggerApp-derived primary depth and is not automatically offset by transducer draft.","Bottom elevation is unavailable because vertical datum/reduction is not established.","Delaunay computation uses a local XY frame for numerical stability; exported geospatial products remain in the configured projected CRS.","Survey-line spacing is estimated from ordered track segments, not nearest-neighbour point spacing.","Automatic survey geometry is an algorithmic estimate, not a survey-standard or accuracy claim.","bathymetry_depth.tiff and depth_surface_presentation.* are presentation products; strict evidence remains bathymetry_depth_strict.tiff, coverage_mask.tiff and depth_surface_strict.*.","Presentation interpolation is not metrological uncertainty or strict coverage evidence.","Side-scan/swath reconstruction requires georeferenced across-track observations; centerline Beam distance is insufficient.","Direct UM982 stream is not inferred from GPS_RAW_INT."]}
+        "warnings":["Beam distance is treated as KoggerApp-derived primary depth and is not automatically offset by transducer draft.","Bottom elevation is unavailable because vertical datum/reduction is not established.","Delaunay computation uses a local XY frame for numerical stability; exported geospatial products remain in the configured projected CRS.","Survey-line spacing is estimated from ordered track segments, not nearest-neighbour point spacing.","Survey-aware triangle QC measures along-track and cross-track span relative to the estimated survey-line axis; isotropic aspect ratio is not a rejection criterion when this mode is active.","Automatic survey geometry and survey-aware QC are algorithmic engineering estimates, not survey-standard or accuracy claims.","bathymetry_depth.tiff and depth_surface_presentation.* are presentation products; strict evidence remains bathymetry_depth_strict.tiff, coverage_mask.tiff and depth_surface_strict.*.","Presentation interpolation is not metrological uncertainty or strict coverage evidence.","Side-scan/swath reconstruction requires georeferenced across-track observations; centerline Beam distance is insufficient.","Direct UM982 stream is not inferred from GPS_RAW_INT."]}
     (config.output_dir/"processing_report.json").write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding="utf-8"); (config.output_dir/"processing_config.json").write_text(json.dumps(asdict(config),default=str,ensure_ascii=False,indent=2),encoding="utf-8")
     finished=datetime.now(timezone.utc).isoformat()
     if config.create_project_database:
