@@ -2,15 +2,25 @@
 setlocal EnableExtensions EnableDelayedExpansion
 cd /d "%~dp0"
 set "VENV=.venv-build"
-set "DIST_DIR=dist\BathymetryMVP"
+set "SPEC_FILE=Navimetry.spec"
+set "DIST_ROOT=dist"
+set "APP_DIR=%DIST_ROOT%\Navimetry"
 set "BUILD_DIR=build"
 set "RELEASE_DIR=portable_release"
-set "ARCHIVE=%RELEASE_DIR%\BathymetryMVP_Portable.zip"
+set "ARCHIVE=%RELEASE_DIR%\Navimetry_Windows_x64_Portable.zip"
 set "CHECKSUM=%ARCHIVE%.sha256.txt"
+
 echo.
-echo Bathymetry MVP portable build
+echo ==========================================
+echo Navimetry 0.2 portable build
+echo ==========================================
 echo Project directory: %CD%
 echo.
+
+if not exist "%SPEC_FILE%" ( echo ERROR: %SPEC_FILE% was not found. & goto :error )
+if not exist "requirements-build.txt" ( echo ERROR: requirements-build.txt was not found. & goto :error )
+if not exist "main.py" ( echo ERROR: main.py was not found. & goto :error )
+
 if not exist "%VENV%\Scripts\python.exe" (
     echo Creating virtual environment...
     py -3.11 -m venv "%VENV%"
@@ -18,101 +28,53 @@ if not exist "%VENV%\Scripts\python.exe" (
 )
 call "%VENV%\Scripts\activate.bat"
 if errorlevel 1 goto :error
-echo Upgrading build tools...
 python -m pip install --upgrade pip setuptools wheel
 if errorlevel 1 goto :error
-echo Installing project dependencies...
-python -m pip install -r requirements-build.txt
+python -m pip install --no-cache-dir -r requirements-build.txt
 if errorlevel 1 goto :error
-echo Running syntax check...
+python -m pip check
+if errorlevel 1 goto :error
 python -m compileall -q main.py bathymetry ui tests
 if errorlevel 1 goto :error
-echo Running tests...
 python -m pytest -q
 if errorlevel 1 goto :error
-echo Cleaning previous build directories...
-if exist "%BUILD_DIR%" (
-    rmdir /s /q "%BUILD_DIR%"
-    if errorlevel 1 goto :error
-)
-if exist "dist" (
-    rmdir /s /q "dist"
-    if errorlevel 1 goto :error
-)
-if exist "%RELEASE_DIR%" (
-    rmdir /s /q "%RELEASE_DIR%"
-    if errorlevel 1 goto :error
-)
+if exist "%BUILD_DIR%" rmdir /s /q "%BUILD_DIR%"
+if exist "%DIST_ROOT%" rmdir /s /q "%DIST_ROOT%"
+if exist "%RELEASE_DIR%" rmdir /s /q "%RELEASE_DIR%"
 mkdir "%RELEASE_DIR%"
 if errorlevel 1 goto :error
-echo Building PyInstaller distribution...
-python -m PyInstaller ^
-    --noconfirm ^
-    --clean ^
-    BathymetryMVP.spec
+python -m PyInstaller --noconfirm --clean "%SPEC_FILE%"
 if errorlevel 1 goto :error
-if not exist "%DIST_DIR%\BathymetryMVP.exe" (
-    echo ERROR: BathymetryMVP.exe was not created.
-    goto :error
-)
-if not exist "README_PORTABLE.txt" (
-    echo ERROR: README_PORTABLE.txt was not found.
-    goto :error
-)
-if not exist "sample_data" (
-    echo ERROR: sample_data directory was not found.
-    goto :error
-)
-echo Copying sample data...
-xcopy /e /i /y ^
-    "sample_data" ^
-    "%DIST_DIR%\sample_data" > nul
+if not exist "%APP_DIR%\Navimetry.exe" ( echo ERROR: Navimetry.exe was not created. & goto :error )
+if exist "README_PORTABLE.txt" copy /y "README_PORTABLE.txt" "%APP_DIR%\README_PORTABLE.txt" > nul
+if exist "sample_data" xcopy /e /i /y "sample_data" "%APP_DIR%\sample_data" > nul
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$projDb = Get-ChildItem -LiteralPath 'dist\Navimetry' -Recurse -Filter 'proj.db' -ErrorAction SilentlyContinue; if (-not $projDb) { Write-Error 'proj.db was not found'; exit 1 }; $gdalData = Get-ChildItem -LiteralPath 'dist\Navimetry' -Recurse -Filter 'gdalvrt.xsd' -ErrorAction SilentlyContinue; if (-not $gdalData) { Write-Error 'gdalvrt.xsd was not found'; exit 1 }"
 if errorlevel 1 goto :error
-echo Copying README...
-copy /y ^
-    "README_PORTABLE.txt" ^
-    "%DIST_DIR%\README_PORTABLE.txt" > nul
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Set-Location 'dist\Navimetry'; $env:QT_QPA_PLATFORM='offscreen'; $p=Start-Process -FilePath '.\Navimetry.exe' -ArgumentList '--self-test' -Wait -PassThru -WindowStyle Hidden; if ($p.ExitCode -ne 0) { exit $p.ExitCode }"
 if errorlevel 1 goto :error
-echo Checking bundled PROJ and GDAL resources...
-powershell -NoProfile -ExecutionPolicy Bypass ^
-    -Command "$projDb = Get-ChildItem -Path 'dist\BathymetryMVP' -Recurse -Filter 'proj.db' -ErrorAction SilentlyContinue; if (-not $projDb) { Write-Error 'proj.db was not found in the portable distribution'; exit 1 }; $gdalData = Get-ChildItem -Path 'dist\BathymetryMVP' -Recurse -Filter 'gdalvrt.xsd' -ErrorAction SilentlyContinue; if (-not $gdalData) { Write-Error 'gdalvrt.xsd was not found in the portable distribution'; exit 1 }; Write-Host 'PROJ and GDAL data found.'"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$root=(Resolve-Path 'dist\Navimetry').Path; $files=Get-ChildItem -LiteralPath $root -Recurse -File | %% { [PSCustomObject]@{ path=$_.FullName.Substring($root.Length+1); size_bytes=$_.Length; sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash } }; [PSCustomObject]@{application='Navimetry'; version='0.2'; platform='Windows x64'; generated_at_utc=(Get-Date).ToUniversalTime().ToString('o'); files=$files} | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath 'dist\Navimetry\build_manifest.json' -Encoding UTF8"
 if errorlevel 1 goto :error
-echo Creating portable ZIP archive...
-powershell -NoProfile -ExecutionPolicy Bypass ^
-    -Command "Compress-Archive -Path 'dist\BathymetryMVP' -DestinationPath '%ARCHIVE%' -Force"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Compress-Archive -LiteralPath 'dist\Navimetry' -DestinationPath '%ARCHIVE%' -Force"
 if errorlevel 1 goto :error
-if not exist "%ARCHIVE%" (
-    echo ERROR: Portable archive was not created.
-    goto :error
-)
-echo Creating SHA256 checksum...
-powershell -NoProfile -ExecutionPolicy Bypass ^
-    -Command "$hash = (Get-FileHash -LiteralPath '%ARCHIVE%' -Algorithm SHA256).Hash; $fileName = [System.IO.Path]::GetFileName('%ARCHIVE%'); Set-Content -LiteralPath '%CHECKSUM%' -Value ($hash + '  ' + $fileName) -Encoding ASCII"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$hash=(Get-FileHash -LiteralPath '%ARCHIVE%' -Algorithm SHA256).Hash; $name=[IO.Path]::GetFileName('%ARCHIVE%'); Set-Content -LiteralPath '%CHECKSUM%' -Value ($hash+'  '+$name) -Encoding ASCII"
 if errorlevel 1 goto :error
-if not exist "%CHECKSUM%" (
-    echo ERROR: SHA256 checksum file was not created.
-    goto :error
-)
-echo Verifying SHA256 checksum...
-powershell -NoProfile -ExecutionPolicy Bypass ^
-    -Command "$checksumLine = Get-Content -LiteralPath '%CHECKSUM%' | Select-Object -First 1; $expectedHash = $checksumLine.Trim().Split(' ')[0].ToUpperInvariant(); $actualHash = (Get-FileHash -LiteralPath '%ARCHIVE%' -Algorithm SHA256).Hash.ToUpperInvariant(); if ($expectedHash -ne $actualHash) { Write-Error 'SHA256 checksum verification failed'; exit 1 }; Write-Host 'SHA256 checksum is valid.'"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$line=Get-Content -LiteralPath '%CHECKSUM%' | Select-Object -First 1; $expected=($line -split '\s+')[0].ToUpperInvariant(); $actual=(Get-FileHash -LiteralPath '%ARCHIVE%' -Algorithm SHA256).Hash.ToUpperInvariant(); if ($expected -ne $actual) { exit 1 }"
 if errorlevel 1 goto :error
-echo Creating latest archive copy...
-copy /y ^
-    "%ARCHIVE%" ^
-    "%RELEASE_DIR%\BathymetryMVP_Portable_latest.zip" > nul
-if errorlevel 1 goto :error
+copy /y "%ARCHIVE%" "%RELEASE_DIR%\Navimetry_Windows_x64_Portable_latest.zip" > nul
 echo.
-echo Build completed successfully.
-echo Portable directory: %DIST_DIR%
+echo ==========================================
+echo Build completed successfully
+echo ==========================================
+echo Application: %APP_DIR%\Navimetry.exe
 echo Archive: %ARCHIVE%
 echo SHA256: %CHECKSUM%
-echo.
+echo Manifest: %APP_DIR%\build_manifest.json
 if /i not "%CI%"=="true" pause
 exit /b 0
 :error
 echo.
-echo Build failed.
-echo.
+echo ==========================================
+echo Build failed
+echo ==========================================
 if /i not "%CI%"=="true" pause
 exit /b 1
