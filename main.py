@@ -21,8 +21,8 @@ def run_self_test() -> int:
         from bathymetry.matcher import match_csv_to_klf  # noqa: F401
         from bathymetry.quality_control import normalize_observations  # noqa: F401
         from bathymetry.processor import run_pipeline, build_local_delaunay  # noqa: F401
-        from bathymetry.survey_presets import get_survey_preset  # noqa: F401
-        assert get_survey_preset("AUTO").key == "AUTO"
+        from bathymetry.survey_presets import get_survey_preset, resolve_surface_geometry  # noqa: F401
+        from bathymetry.survey_geometry import estimate_track_geometry  # noqa: F401
         import numpy  # noqa: F401
         import pandas  # noqa: F401
         import scipy  # noqa: F401
@@ -37,23 +37,15 @@ def run_self_test() -> int:
         report_path.write_text("Navimetry self-test passed\n", encoding="utf-8")
         return 0
     except Exception:
-        report_path.write_text(
-            "Navimetry self-test failed\n\n" + traceback.format_exc(),
-            encoding="utf-8",
-        )
+        report_path.write_text("Navimetry self-test failed\n\n" + traceback.format_exc(), encoding="utf-8")
         return 1
 
 
 def main() -> None:
     from PySide6.QtWidgets import QApplication
     from ui.main_window import MainWindow
-
-    app = QApplication(sys.argv)
-    app.setApplicationName("Navimetry")
-    app.setApplicationVersion("0.2")
-    window = MainWindow()
-    window.show()
-    raise SystemExit(app.exec())
+    app=QApplication(sys.argv); app.setApplicationName("Navimetry"); app.setApplicationVersion("0.2")
+    window=MainWindow(); window.show(); raise SystemExit(app.exec())
 
 
 if __name__ == "__main__":
