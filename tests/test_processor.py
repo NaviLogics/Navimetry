@@ -3,11 +3,12 @@ import numpy as np
 import pandas as pd
 import rasterio
 from bathymetry.models import ProcessingConfig
-from bathymetry.processor import run_pipeline, build_local_delaunay
+from bathymetry.processor import run_pipeline, build_local_delaunay, triangle_metrics
 from bathymetry.csv_importer import import_kogger_csv
 from bathymetry.quality_control import normalize_observations
 from bathymetry.survey_geometry import estimate_track_geometry
 from bathymetry.survey_presets import get_survey_preset, resolve_surface_geometry
+from bathymetry.survey_triangle_qc import evaluate_triangles
 
 
 def test_beam_is_primary_and_zero_coordinates_rejected(tmp_path: Path) -> None:
@@ -70,6 +71,39 @@ def test_auto_preset_uses_estimated_spacing_not_point_spacing(tmp_path: Path) ->
     assert effective["line_spacing_source"]=="estimated_from_track_segments"
     assert abs(effective["strict_max_triangle_edge_m"]-6.75)<1e-9
     assert abs(effective["presentation_radius_m"]-3.75)<1e-9
+    assert effective["strict_cross_track_factor"]==1.35
+    assert effective["strict_along_track_factor"]==2.0
+
+
+def test_survey_aware_qc_accepts_skinny_adjacent_line_triangle(tmp_path: Path) -> None:
+    # Triangle 0 is intentionally skinny: two dense along-track samples only 2 cm apart
+    # and one point on the adjacent 5 m survey line. Its isotropic aspect ratio is huge,
+    # but its survey-axis spans are valid. Triangle 1 skips more than one line spacing.
+    xy=np.array([
+        [0.00,0.0], [0.02,0.0], [0.00,5.0],
+        [0.00,0.0], [0.02,0.0], [0.00,12.0],
+    ],dtype=float)
+    depth=np.array([2.0,2.01,2.1,2.0,2.01,2.2],dtype=float)
+    faces=np.array([[0,1,2],[3,4,5]],dtype=np.int64)
+    metrics=triangle_metrics(xy,depth,faces)
+    assert metrics.loc[0,"aspect_ratio"] > 20.0
+    cfg=ProcessingConfig(input_csv=tmp_path/"x.csv",output_dir=tmp_path/"out")
+    effective={
+        "effective_line_spacing_m":5.0,
+        "geometry":"single_beam_centerline",
+        "strict_cross_track_factor":1.35,
+        "strict_along_track_factor":2.0,
+        "cross_line_threshold_factor":0.25,
+        "strict_max_triangle_edge_m":6.75,
+        "strict_max_triangle_edge_source":"line_spacing_x_1.350",
+    }
+    track={"dominant_axis_heading_deg":0.0}
+    accepted,info=evaluate_triangles(metrics,xy,faces,cfg,0.02,effective,track)
+    assert accepted.tolist()==[0]
+    assert info["triangle_qc_mode"]=="survey_aware_anisotropic_v1"
+    assert info["aspect_ratio_used_as_rejection"] is False
+    assert metrics.loc[0,"quality_status"]=="accepted"
+    assert metrics.loc[1,"fails_cross_track_span"]
 
 
 def test_pipeline_creates_v02_products(tmp_path: Path) -> None:
@@ -98,10 +132,11 @@ def test_pipeline_creates_v02_products(tmp_path: Path) -> None:
     with rasterio.open(output_dir/"presentation_mask.tiff") as ds: presentation_mask=ds.read(1).astype(bool)
     assert np.all(~strict_mask | presentation_mask)
     assert np.count_nonzero(presentation != -9999.0) >= np.count_nonzero(strict != -9999.0)
-    assert result["surface"]["surface_qc_version"] == "4"
+    assert result["surface"]["surface_qc_version"] == "5"
     assert result["surface"]["presentation_grid_is_quality_evidence"] is False
     assert result["surface"]["delaunay"]["all_vertices_used"] is True
     assert result["surface"]["presentation_mesh"]["written"] is True
+    assert result["surface"]["triangle_qc"]["triangle_qc_version"] == "survey-aware-v1"
     assert result["survey_geometry"]["version"] == "1"
     assert result["survey_geometry"]["selected_preset"]["key"] == "AUTO"
     assert result["classification"]["primary_depth_source"] == "KOGGERAPP_BEAM"
