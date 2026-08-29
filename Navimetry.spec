@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pyproj
 import rasterio
-from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
+from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, collect_submodules
 
 block_cipher = None
 datas = []
@@ -24,7 +24,12 @@ gdal_data_dir = rasterio_dir / "gdal_data"
 if (gdal_data_dir / "gdalvrt.xsd").is_file():
     datas.append((str(gdal_data_dir), "rasterio/gdal_data"))
 
-hiddenimports = [
+# Rasterio contains Python modules that are imported dynamically from Cython
+# extensions (for example rasterio.sample). Collect its submodules explicitly
+# so the frozen application behaves like the normal Python environment.
+hiddenimports = collect_submodules("rasterio")
+hiddenimports += collect_submodules("pyproj")
+hiddenimports += [
     "bathymetry.csv_importer",
     "bathymetry.klf_parser",
     "bathymetry.clock_sync",
@@ -35,14 +40,13 @@ hiddenimports = [
     "PySide6.QtGui",
     "PySide6.QtWidgets",
     "matplotlib.backends.backend_agg",
-    "rasterio._base",
-    "rasterio._env",
-    "rasterio._io",
-    "rasterio._warp",
-    "rasterio._features",
-    "pyproj.database",
-    "pyproj.datadir",
     "scipy.spatial._qhull",
+]
+
+# Keep test modules out of the portable distribution.
+hiddenimports = [
+    name for name in dict.fromkeys(hiddenimports)
+    if ".tests" not in name and not name.endswith(".tests")
 ]
 
 a = Analysis(
