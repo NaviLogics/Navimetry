@@ -10,7 +10,7 @@ from typing import Callable
 
 try:
     import laspy
-except ImportError:  # build/runtime dependency checked by --self-test
+except ImportError:
     laspy = None
 import matplotlib
 matplotlib.use("Agg")
@@ -31,6 +31,7 @@ from bathymetry.clock_sync import build_clock_model
 from bathymetry.matcher import match_csv_to_klf
 from bathymetry.quality_control import normalize_observations, build_surface_points, QualityError
 from bathymetry.project_store import initialize_database, store_dataframe
+from bathymetry.survey_presets import get_survey_preset, preset_metadata
 
 
 class ProcessingError(Exception):
@@ -55,99 +56,157 @@ def median_spacing(points: np.ndarray) -> float:
     return float(np.median(positive))
 
 
+def build_local_delaunay(xy: np.ndarray) -> tuple[Delaunay, np.ndarray, np.ndarray, dict]:
+    """Triangulate in a numerically stable local XY frame while preserving projected coordinates elsewhere."""
+    if len(xy) < 3:
+        raise ProcessingError("At least three surface points are required for Delaunay triangulation")
+    origin=np.mean(xy,axis=0,dtype=np.float64)
+    local_xy=xy.astype(np.float64)-origin
+    try:
+        tri=Delaunay(local_xy)
+    except QhullError as error:
+        raise ProcessingError("Cannot build local-coordinate Delaunay surface from current points") from error
+    used=np.unique(tri.simplices.ravel()) if len(tri.simplices) else np.array([],dtype=np.int64)
+    coplanar_count=int(len(getattr(tri,"coplanar",[])))
+    info={
+        "coordinate_frame":"local_xy_for_computation",
+        "local_origin_x_m":float(origin[0]),
+        "local_origin_y_m":float(origin[1]),
+        "input_vertices":int(len(xy)),
+        "used_vertices":int(len(used)),
+        "coplanar_vertices":coplanar_count,
+        "all_vertices_used":bool(len(used)==len(xy) and coplanar_count==0),
+    }
+    return tri,local_xy,origin,info
+
+
 def triangle_metrics(xy: np.ndarray, depth: np.ndarray, faces: np.ndarray) -> pd.DataFrame:
-    rows = []
-    for idx, face in enumerate(faces):
-        p = xy[face]
-        z = depth[face]
-        edges = np.array([
-            np.linalg.norm(p[0]-p[1]), np.linalg.norm(p[1]-p[2]), np.linalg.norm(p[2]-p[0])
-        ], dtype=float)
-        a, b, c = edges
-        area = abs(np.cross(p[1]-p[0], p[2]-p[0])) / 2.0
-        min_edge = float(edges.min()); max_edge = float(edges.max())
-        aspect = max_edge / min_edge if min_edge > 0 else math.inf
-        angles = []
-        for aa, bb, cc in ((a,b,c),(b,c,a),(c,a,b)):
-            den = 2*aa*bb
-            cosv = (aa*aa + bb*bb - cc*cc)/den if den > 0 else 1.0
-            angles.append(math.degrees(math.acos(max(-1.0, min(1.0, cosv)))))
-        gradient = float((z.max()-z.min())/max_edge) if max_edge > 0 else math.inf
+    rows=[]
+    for idx,face in enumerate(faces):
+        p=xy[face]; z=depth[face]
+        edges=np.array([np.linalg.norm(p[0]-p[1]),np.linalg.norm(p[1]-p[2]),np.linalg.norm(p[2]-p[0])],dtype=float)
+        a,b,c=edges
+        area=abs(np.cross(p[1]-p[0],p[2]-p[0]))/2.0
+        min_edge=float(edges.min()); max_edge=float(edges.max())
+        aspect=max_edge/min_edge if min_edge>0 else math.inf
+        angles=[]
+        for aa,bb,cc in ((a,b,c),(b,c,a),(c,a,b)):
+            den=2*aa*bb
+            cosv=(aa*aa+bb*bb-cc*cc)/den if den>0 else 1.0
+            angles.append(math.degrees(math.acos(max(-1.0,min(1.0,cosv)))))
+        gradient=float((z.max()-z.min())/max_edge) if max_edge>0 else math.inf
         rows.append({
-            "triangle_index": idx, "v0": int(face[0]), "v1": int(face[1]), "v2": int(face[2]),
-            "min_edge_m": min_edge, "max_edge_m": max_edge, "area_m2": float(area),
-            "aspect_ratio": float(aspect), "max_angle_deg": float(max(angles)),
-            "depth_gradient_m_per_m": gradient,
+            "triangle_index":idx,"v0":int(face[0]),"v1":int(face[1]),"v2":int(face[2]),
+            "min_edge_m":min_edge,"max_edge_m":max_edge,"area_m2":float(area),
+            "aspect_ratio":float(aspect),"max_angle_deg":float(max(angles)),
+            "depth_gradient_m_per_m":gradient,
         })
     return pd.DataFrame(rows)
 
 
-def filter_triangles(metrics: pd.DataFrame, config: ProcessingConfig, spacing: float) -> tuple[np.ndarray, dict]:
+def filter_triangles(metrics: pd.DataFrame, config: ProcessingConfig, spacing: float, preset) -> tuple[np.ndarray,dict]:
     if metrics.empty:
         raise ProcessingError("Triangulation contains no triangles")
-    edge_limit = config.max_triangle_edge_m if config.max_triangle_edge_m is not None else max(spacing * 4.0, float(metrics["max_edge_m"].quantile(0.25)))
-    mask = (
-        metrics["max_edge_m"].le(edge_limit)
-        & metrics["aspect_ratio"].le(config.max_triangle_aspect_ratio)
-        & metrics["max_angle_deg"].le(config.max_triangle_angle_deg)
-        & metrics["area_m2"].ge(config.min_triangle_area_m2)
-    )
+    if config.max_triangle_edge_m is not None:
+        edge_limit=float(config.max_triangle_edge_m); edge_mode="manual"
+    elif preset.max_triangle_edge_m is not None:
+        edge_limit=float(preset.max_triangle_edge_m); edge_mode=f"preset:{preset.key}"
+    else:
+        edge_limit=max(spacing*4.0,float(metrics["max_edge_m"].quantile(0.25))); edge_mode="automatic"
+    mask=(metrics["max_edge_m"].le(edge_limit)
+          & metrics["aspect_ratio"].le(config.max_triangle_aspect_ratio)
+          & metrics["max_angle_deg"].le(config.max_triangle_angle_deg)
+          & metrics["area_m2"].ge(config.min_triangle_area_m2))
     if config.max_depth_gradient_m_per_m is not None:
         mask &= metrics["depth_gradient_m_per_m"].le(config.max_depth_gradient_m_per_m)
-    metrics["quality_status"] = np.where(mask, "accepted", "rejected")
-    accepted_indices = metrics.loc[mask, "triangle_index"].to_numpy(dtype=np.int64)
-    if len(accepted_indices) == 0:
-        raise ProcessingError("Triangle QC rejected all triangles; review geometry thresholds")
-    return accepted_indices, {
-        "max_triangle_edge_m": float(edge_limit),
-        "max_triangle_edge_mode": "manual" if config.max_triangle_edge_m is not None else "automatic",
-    }
+    metrics["quality_status"]=np.where(mask,"accepted","rejected")
+    accepted_indices=metrics.loc[mask,"triangle_index"].to_numpy(dtype=np.int64)
+    if len(accepted_indices)==0:
+        raise ProcessingError("Triangle QC rejected all triangles; review geometry thresholds or survey preset")
+    return accepted_indices,{"max_triangle_edge_m":float(edge_limit),"max_triangle_edge_mode":edge_mode}
 
 
-def _las_scale_and_offset(values: np.ndarray) -> tuple[float, float]:
-    safe_limit = float(np.iinfo(np.int32).max) * 0.90
-    span = float(values.max()-values.min())
-    scale = max(0.001, span/safe_limit if span else 0.001)
-    return scale, float(values.min())
+def _las_scale_and_offset(values: np.ndarray) -> tuple[float,float]:
+    safe_limit=float(np.iinfo(np.int32).max)*0.90
+    span=float(values.max()-values.min())
+    scale=max(0.001,span/safe_limit if span else 0.001)
+    return scale,float(values.min())
 
 
 def write_las(points: pd.DataFrame, path: Path, output_crs: str) -> dict:
     if laspy is None:
         raise ProcessingError("laspy is unavailable")
-    x = points["x_m"].to_numpy(float); y = points["y_m"].to_numpy(float)
-    depth = points["depth_primary_m"].to_numpy(float); z = -depth
+    x=points["x_m"].to_numpy(float); y=points["y_m"].to_numpy(float)
+    depth=points["depth_primary_m"].to_numpy(float); z=-depth
     sx,ox=_las_scale_and_offset(x); sy,oy=_las_scale_and_offset(y); sz,oz=_las_scale_and_offset(z)
-    header = laspy.LasHeader(point_format=3, version="1.2")
+    header=laspy.LasHeader(point_format=3,version="1.2")
     header.scales=np.array([sx,sy,sz]); header.offsets=np.array([ox,oy,oz])
     header.add_crs(CRS.from_user_input(output_crs))
-    for name, dtype in (("depth_m", np.float32),("beam_distance_m", np.float32),("quality_code", np.uint8),("source_id", np.uint32)):
-        header.add_extra_dim(laspy.ExtraBytesParams(name=name, type=dtype))
-    las = laspy.LasData(header)
+    for name,dtype in (("depth_m",np.float32),("beam_distance_m",np.float32),("quality_code",np.uint8),("source_id",np.uint32)):
+        header.add_extra_dim(laspy.ExtraBytesParams(name=name,type=dtype))
+    las=laspy.LasData(header)
     las.x=x; las.y=y; las.z=z
     las.depth_m=depth.astype(np.float32)
     las.beam_distance_m=points["beam_distance_raw_m"].to_numpy(float).astype(np.float32)
-    las.quality_code=points.get("quality_code", pd.Series(1,index=points.index)).to_numpy(np.uint8)
+    las.quality_code=points.get("quality_code",pd.Series(1,index=points.index)).to_numpy(np.uint8)
     las.source_id=np.arange(1,len(points)+1,dtype=np.uint32)
     las.write(path)
     return {"scales":[sx,sy,sz],"offsets":[ox,oy,oz]}
 
 
 def write_xyz(points: pd.DataFrame, path: Path) -> None:
-    points[["x_m","y_m","depth_primary_m"]].to_csv(path, sep=" ", index=False, header=False, float_format="%.4f")
+    points[["x_m","y_m","depth_primary_m"]].to_csv(path,sep=" ",index=False,header=False,float_format="%.4f")
 
 
-def write_mesh(xy: np.ndarray, depth: np.ndarray, faces: np.ndarray, output_dir: Path, output_crs: str) -> None:
-    origin_x=float(xy[:,0].min()); origin_y=float(xy[:,1].min())
-    vertices=np.column_stack((xy[:,0]-origin_x, xy[:,1]-origin_y, -depth))
-    mesh=trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+def _export_mesh(vertices: np.ndarray, faces: np.ndarray, output_dir: Path, basename: str) -> dict:
+    mesh=trimesh.Trimesh(vertices=vertices,faces=faces,process=False)
     mesh.remove_unreferenced_vertices()
-    mesh.export(output_dir/"depth_surface.obj")
-    mesh.export(output_dir/"depth_surface.stl")
-    (output_dir/"depth_surface_metadata.json").write_text(json.dumps({
-        "horizontal_crs":output_crs,"units":"m","local_origin_x_m":origin_x,"local_origin_y_m":origin_y,
-        "model_z_definition":"z = -depth_primary_m","depth_source":"KOGGERAPP_BEAM",
-        "vertical_datum":"unknown","bottom_elevation_available":False,
-    },ensure_ascii=False,indent=2),encoding="utf-8")
+    mesh.export(output_dir/f"{basename}.obj")
+    mesh.export(output_dir/f"{basename}.stl")
+    return {"vertices":int(len(mesh.vertices)),"faces":int(len(mesh.faces))}
+
+
+def write_strict_mesh(xy: np.ndarray, depth: np.ndarray, faces: np.ndarray, output_dir: Path, output_crs: str, local_origin: np.ndarray) -> dict:
+    vertices=np.column_stack((xy[:,0]-local_origin[0],xy[:,1]-local_origin[1],-depth))
+    info=_export_mesh(vertices,faces,output_dir,"depth_surface_strict")
+    shutil.copy2(output_dir/"depth_surface_strict.obj",output_dir/"depth_surface.obj")
+    shutil.copy2(output_dir/"depth_surface_strict.stl",output_dir/"depth_surface.stl")
+    metadata={
+        "horizontal_crs":output_crs,"units":"m","local_origin_x_m":float(local_origin[0]),"local_origin_y_m":float(local_origin[1]),
+        "model_z_definition":"z = -depth_primary_m","depth_source":"KOGGERAPP_BEAM","vertical_datum":"unknown",
+        "bottom_elevation_available":False,"mesh_role":"strict_triangle_qc","legacy_aliases":["depth_surface.obj","depth_surface.stl"],**info,
+    }
+    (output_dir/"depth_surface_strict_metadata.json").write_text(json.dumps(metadata,ensure_ascii=False,indent=2),encoding="utf-8")
+    (output_dir/"depth_surface_metadata.json").write_text(json.dumps(metadata,ensure_ascii=False,indent=2),encoding="utf-8")
+    return info
+
+
+def write_presentation_grid_mesh(raster: np.ndarray, west: float, north: float, pixel_size: float, output_dir: Path, output_crs: str) -> dict:
+    valid=np.isfinite(raster)
+    rows,cols=np.nonzero(valid)
+    if len(rows)<3:
+        return {"vertices":0,"faces":0,"written":False}
+    ids=np.full(raster.shape,-1,dtype=np.int64)
+    ids[rows,cols]=np.arange(len(rows),dtype=np.int64)
+    x=west+(cols+0.5)*pixel_size
+    y=north-(rows+0.5)*pixel_size
+    origin=np.array([float(np.min(x)),float(np.min(y))],dtype=float)
+    vertices=np.column_stack((x-origin[0],y-origin[1],-raster[rows,cols]))
+    a=ids[:-1,:-1]; b=ids[:-1,1:]; c=ids[1:,:-1]; d=ids[1:,1:]
+    quads=(a>=0)&(b>=0)&(c>=0)&(d>=0)
+    qr,qc=np.nonzero(quads)
+    if len(qr)==0:
+        return {"vertices":int(len(vertices)),"faces":0,"written":False}
+    av=a[qr,qc]; bv=b[qr,qc]; cv=c[qr,qc]; dv=d[qr,qc]
+    faces=np.vstack((np.column_stack((av,cv,bv)),np.column_stack((bv,cv,dv)))).astype(np.int64)
+    info=_export_mesh(vertices,faces,output_dir,"depth_surface_presentation")
+    metadata={
+        "horizontal_crs":output_crs,"units":"m","local_origin_x_m":float(origin[0]),"local_origin_y_m":float(origin[1]),
+        "model_z_definition":"z = -presentation_depth_m","depth_source":"KOGGERAPP_BEAM","vertical_datum":"unknown",
+        "mesh_role":"presentation_grid_not_quality_evidence","pixel_size_m":float(pixel_size),**info,
+    }
+    (output_dir/"depth_surface_presentation_metadata.json").write_text(json.dumps(metadata,ensure_ascii=False,indent=2),encoding="utf-8")
+    return {**info,"written":True}
 
 
 def _write_raster(path: Path, array: np.ndarray, transform, crs: str, nodata, dtype: str, description: str, tags: dict) -> None:
@@ -156,46 +215,40 @@ def _write_raster(path: Path, array: np.ndarray, transform, crs: str, nodata, dt
         ds.write(array.astype(dtype),1); ds.set_band_description(1,description); ds.update_tags(**tags)
 
 
-def write_surface_products(points: pd.DataFrame, triangulation: Delaunay, accepted_faces: np.ndarray,
-                           pixel_size: float, output_dir: Path, output_crs: str,
-                           config: ProcessingConfig, spacing: float) -> dict:
-    """Surface QC v2: strict evidence plus a separately labelled presentation grid."""
+def write_surface_products(points: pd.DataFrame, triangulation: Delaunay, local_xy: np.ndarray, local_origin: np.ndarray,
+                           accepted_faces: np.ndarray, pixel_size: float, output_dir: Path, output_crs: str,
+                           config: ProcessingConfig, spacing: float, preset) -> dict:
+    """Surface QC v3: local-coordinate interpolation, strict evidence, and a broader presentation grid."""
     x=points["x_m"].to_numpy(float); y=points["y_m"].to_numpy(float); depth=points["depth_primary_m"].to_numpy(float)
     west,east,south,north=float(x.min()),float(x.max()),float(y.min()),float(y.max())
     width=max(1,int(math.ceil((east-west)/pixel_size))); height=max(1,int(math.ceil((north-south)/pixel_size)))
-    if width*height>20_000_000: raise ProcessingError("Raster too large; increase pixel size")
+    if width*height>20_000_000:
+        raise ProcessingError("Raster too large; increase pixel size")
     gx=west+(np.arange(width)+0.5)*pixel_size; gy=north-(np.arange(height)+0.5)*pixel_size
     mx,my=np.meshgrid(gx,gy); grid=np.column_stack((mx.ravel(),my.ravel()))
+    grid_local=grid-local_origin
 
-    # One linear interpolator is used for both products. The difference is only the support mask.
     interp=LinearNDInterpolator(triangulation,depth,fill_value=np.nan)
-    full_values=np.asarray(interp(grid),float)
-    simplex=triangulation.find_simplex(grid)
-    inside_hull=simplex >= 0
+    full_values=np.asarray(interp(grid_local),float)
+    simplex=triangulation.find_simplex(grid_local); inside_hull=simplex>=0
 
-    # Strict engineering coverage: only cells in triangles that passed triangle QC.
     allowed=set(int(i) for i in accepted_faces.tolist())
     strict_support=np.array([(sid in allowed) for sid in simplex],dtype=bool)
     strict_values=full_values.copy(); strict_values[~strict_support]=np.nan
-    strict_raster=strict_values.reshape(height,width)
-    strict_mask=strict_support.reshape(height,width)
+    strict_raster=strict_values.reshape(height,width); strict_mask=strict_support.reshape(height,width)
 
-    # Presentation grid: still no extrapolation outside the Delaunay hull, and every cell is
-    # constrained by distance to an actually accepted surface observation. This is deliberately
-    # broader than strict coverage, but it is not promoted to measurement-quality evidence.
-    tree=cKDTree(np.column_stack((x,y)))
-    nearest=tree.query(grid,k=1)[0].reshape(height,width)
-    nearest_flat=nearest.ravel()
+    tree=cKDTree(local_xy)
+    nearest=tree.query(grid_local,k=1)[0].reshape(height,width); nearest_flat=nearest.ravel()
     if config.max_nearest_point_distance_m is not None:
-        presentation_radius=float(config.max_nearest_point_distance_m)
-        radius_mode="manual"
+        presentation_radius=float(config.max_nearest_point_distance_m); radius_mode="manual"
+    elif preset.presentation_radius_m is not None:
+        presentation_radius=float(preset.presentation_radius_m); radius_mode=f"preset:{preset.key}"
     else:
-        presentation_radius=float(min(5.0,max(1.5,spacing*8.0)))
-        radius_mode="automatic_8x_median_spacing_clamped_1.5_to_5m"
-    presentation_support=inside_hull & (nearest_flat <= presentation_radius)
+        presentation_radius=float(min(5.0,max(1.5,spacing*8.0))); radius_mode="automatic_8x_median_spacing_clamped_1.5_to_5m"
+    # Presentation is always a superset of strict evidence, even if a manually selected radius is smaller.
+    presentation_support=(inside_hull & (nearest_flat<=presentation_radius)) | strict_support
     presentation_values=full_values.copy(); presentation_values[~presentation_support]=np.nan
-    presentation_raster=presentation_values.reshape(height,width)
-    presentation_mask=presentation_support.reshape(height,width)
+    presentation_raster=presentation_values.reshape(height,width); presentation_mask=presentation_support.reshape(height,width)
 
     transform=from_origin(west,north,pixel_size,pixel_size)
     common_tags={"units":"m","depth_direction":"positive_down","depth_source":"KOGGERAPP_BEAM","vertical_datum":"unknown"}
@@ -206,7 +259,7 @@ def write_surface_products(points: pd.DataFrame, triangulation: Delaunay, accept
     _write_raster(output_dir/"coverage_mask.tiff",strict_mask.astype(np.uint8),transform,output_crs,0,"uint8",
                   "Strict surface support mask",{"meaning":"1=supported_by_triangle_that_passed_strict_QC,0=not_strictly_supported"})
     _write_raster(output_dir/"presentation_mask.tiff",presentation_mask.astype(np.uint8),transform,output_crs,0,"uint8",
-                  "Presentation grid support mask",{"meaning":"1=inside_Delaunay_hull_and_within_nearest_point_radius","radius_m":f"{presentation_radius:.6f}","not_quality_evidence":"true"})
+                  "Presentation grid support mask",{"meaning":"1=inside_Delaunay_hull_and_within_radius_or_strict_support","radius_m":f"{presentation_radius:.6f}","not_quality_evidence":"true"})
     _write_raster(output_dir/"nearest_point_distance.tiff",nearest.astype(np.float32),transform,output_crs,-9999.0,"float32",
                   "Distance to nearest accepted observation, m",{"units":"m"})
     if config.generate_quality_proxy:
@@ -214,27 +267,25 @@ def write_surface_products(points: pd.DataFrame, triangulation: Delaunay, accept
         _write_raster(output_dir/"support_quality.tiff",proxy,transform,output_crs,-9999.0,"float32",
                       "Support distance proxy (0 best, 1 worst)",{"not_metrological_uncertainty":"true","reference_radius_m":f"{presentation_radius:.6f}"})
 
-    # Presentation PDF: raster is primary. Strict engineering support is outlined separately.
+    presentation_mesh=write_presentation_grid_mesh(presentation_raster,west,north,pixel_size,output_dir,output_crs)
+
     fig,ax=plt.subplots(figsize=(11.69,8.27))
     im=ax.imshow(presentation_raster,extent=(west,east,south,north),origin="upper",aspect="equal")
     if strict_mask.any() and not strict_mask.all():
         ax.contour(gx,gy[::-1],strict_mask.astype(np.uint8),levels=[0.5],linewidths=0.7)
     fig.colorbar(im,ax=ax,shrink=.8,label="Depth, m")
-    ax.set_title("Navimetry 0.2 Surface QC v2 — presentation bathymetric grid")
+    ax.set_title("Navimetry 0.2 Surface QC v3 — presentation bathymetric grid")
     ax.set_xlabel("X, m"); ax.set_ylabel("Y, m")
     ax.text(.01,.01,
             f"CRS: {output_crs}\nDepth source: KOGGERAPP_BEAM\nVertical datum: unknown\nPixel: {pixel_size:.3f} m\nPresentation radius: {presentation_radius:.2f} m\nStrict coverage outline: triangle QC",
             transform=ax.transAxes,fontsize=8,va="bottom",bbox={"facecolor":"white","alpha":.8,"edgecolor":"gray"})
     fig.tight_layout(); fig.savefig(output_dir/"processing_report.pdf",dpi=180); plt.close(fig)
-    shutil.copy2(output_dir/"processing_report.pdf", output_dir/"bathymetry_map.pdf")
+    shutil.copy2(output_dir/"processing_report.pdf",output_dir/"bathymetry_map.pdf")
     return {
-        "surface_qc_version":"2",
-        "width":width,"height":height,"pixel_size_m":pixel_size,
-        "strict_supported_cells":int(strict_mask.sum()),
-        "presentation_supported_cells":int(presentation_mask.sum()),
-        "presentation_radius_m":presentation_radius,
-        "presentation_radius_mode":radius_mode,
-        "presentation_grid_is_quality_evidence":False,
+        "surface_qc_version":"3","width":width,"height":height,"pixel_size_m":pixel_size,
+        "strict_supported_cells":int(strict_mask.sum()),"presentation_supported_cells":int(presentation_mask.sum()),
+        "presentation_radius_m":presentation_radius,"presentation_radius_mode":radius_mode,
+        "presentation_grid_is_quality_evidence":False,"presentation_mesh":presentation_mesh,
     }
 
 
@@ -281,8 +332,14 @@ def run_pipeline(config: ProcessingConfig, progress: Callable[[str],None] | None
     started=datetime.now(timezone.utc).isoformat()
     if config.apply_vertical_correction:
         raise ProcessingError("Navimetry 0.2 does not automatically apply vertical correction to Beam distance. Use vertical_reduction_mode only after explicit datum design.")
-    if config.min_depth_m >= config.max_depth_m:
+    if config.min_depth_m>=config.max_depth_m:
         raise ProcessingError("Minimum depth must be smaller than maximum depth")
+    try:
+        preset=get_survey_preset(config.survey_preset)
+    except ValueError as error:
+        raise ProcessingError(str(error)) from error
+    if preset.requires_georeferenced_swath_points and not config.has_georeferenced_swath_points:
+        raise ProcessingError("The SWATH_SIDESCAN preset requires georeferenced across-track/swath bottom points. Vessel-centerline Beam distance alone cannot reconstruct port/starboard swath geometry.")
     config.output_dir.mkdir(parents=True,exist_ok=True)
 
     notify("Import KoggerApp CSV")
@@ -321,58 +378,60 @@ def run_pipeline(config: ProcessingConfig, progress: Callable[[str],None] | None
 
     xy=surface_points[["x_m","y_m"]].to_numpy(float); depths=surface_points["depth_primary_m"].to_numpy(float)
     spacing=median_spacing(xy)
-    notify("Build Delaunay and triangle QC")
-    try:
-        tri=Delaunay(xy)
-    except QhullError as error:
-        raise ProcessingError("Cannot build Delaunay surface from current points") from error
-    tm=triangle_metrics(xy,depths,tri.simplices)
-    accepted_indices,triangle_config=filter_triangles(tm,config,spacing)
+    notify("Build local-coordinate Delaunay and triangle QC")
+    tri,local_xy,local_origin,delaunay_info=build_local_delaunay(xy)
+    tm=triangle_metrics(local_xy,depths,tri.simplices)
+    accepted_indices,triangle_config=filter_triangles(tm,config,spacing,preset)
     tm.to_csv(config.output_dir/"triangle_quality.csv",index=False,encoding="utf-8-sig")
     faces=tri.simplices[accepted_indices]
 
     pixel=config.pixel_size_m if config.pixel_size_m is not None else max(spacing/2.0,0.05)
-    notify("Write XYZ, LAS, OBJ, STL")
+    notify("Write XYZ, LAS, strict OBJ/STL")
     write_xyz(surface_points,config.output_dir/"bottom_points.xyz")
     las_info=write_las(surface_points,config.output_dir/"bottom_points.las",config.output_crs)
-    write_mesh(xy,depths,faces,config.output_dir,config.output_crs)
-    notify("Write Surface QC v2 strict/presentation GeoTIFF and PDF")
-    raster_info=write_surface_products(surface_points,tri,accepted_indices,pixel,config.output_dir,config.output_crs,config,spacing)
+    strict_mesh_info=write_strict_mesh(xy,depths,faces,config.output_dir,config.output_crs,local_origin)
+    notify("Write Surface QC v3 strict/presentation GeoTIFF, presentation OBJ/STL and PDF")
+    raster_info=write_surface_products(surface_points,tri,local_xy,local_origin,accepted_indices,pixel,config.output_dir,config.output_crs,config,spacing,preset)
 
     klf_inv=asdict(klf_result.inventory) if klf_result is not None else None
     report={
         "application":"Navimetry","version":"0.2-portable","classification":{
-            "primary_depth_source":"KOGGERAPP_BEAM","rangefinder_role":"validation_only",
-            "vertical_datum":"unknown","manual_beam_correction":"unknown","industrial_accuracy":"not_established",
+            "primary_depth_source":"KOGGERAPP_BEAM","rangefinder_role":"validation_only","vertical_datum":"unknown",
+            "manual_beam_correction":"unknown","industrial_accuracy":"not_established",
         },
         "source_assets":{"csv":{"filename":config.input_csv.name,**csv_asset},"klf":({"filename":config.input_klf.name,**klf_asset} if klf_asset else None)},
-        "csv_inventory":csv_result.inventory,
-        "klf_inventory":klf_inv,
-        "clock_model":clock,
-        "csv_klf_match":match_report,
+        "csv_inventory":csv_result.inventory,"klf_inventory":klf_inv,"clock_model":clock,"csv_klf_match":match_report,
+        "survey_geometry":{
+            "selected_preset":preset_metadata(config.survey_preset),"configured_geometry":config.survey_geometry,
+            "expected_line_spacing_m":config.expected_line_spacing_m if config.expected_line_spacing_m is not None else preset.expected_line_spacing_m,
+            "swath_half_width_m":config.swath_half_width_m,"has_georeferenced_swath_points":config.has_georeferenced_swath_points,
+            "preset_values_are_accuracy_claims":False,
+        },
         "source_semantics":{
-            "Beam distance":"KoggerApp-derived primary depth",
-            "Rangefinder":"validation only; unavailable when disabled/not recorded",
-            "GLOBAL_POSITION_INT":"PX4 estimated global position",
-            "GPS_RAW_INT":"raw GNSS evidence through PX4 MAVLink",
-            "ATTITUDE":"PX4 estimated attitude",
-            "ID_CHART":"raw sonar acoustic chart fragments",
+            "Beam distance":"KoggerApp-derived primary depth","Rangefinder":"validation only; unavailable when disabled/not recorded",
+            "GLOBAL_POSITION_INT":"PX4 estimated global position","GPS_RAW_INT":"raw GNSS evidence through PX4 MAVLink",
+            "ATTITUDE":"PX4 estimated attitude","ID_CHART":"raw sonar acoustic chart fragments",
         },
         "qc":{
-            "normalized_rows":int(len(observations)),"surface_eligible_rows":int(len(accepted)),
-            "rejected_for_surface_rows":int(len(rejected)),"suspect_rows":int(len(suspect)),
-            "zero_coordinate_rows":int(((observations.latitude_raw_deg==0)&(observations.longitude_raw_deg==0)).sum()),
+            "normalized_rows":int(len(observations)),"surface_eligible_rows":int(len(accepted)),"rejected_for_surface_rows":int(len(rejected)),
+            "suspect_rows":int(len(suspect)),"zero_coordinate_rows":int(((observations.latitude_raw_deg==0)&(observations.longitude_raw_deg==0)).sum()),
             "beam_valid_rows":int(observations.depth_primary_m.notna().sum()),"beam_missing_rows":int(observations.depth_primary_m.isna().sum()),
             "rangefinder_available_rows":int(observations.rangefinder_available.sum()),
         },
-        "surface":{"working_unique_xy_points":int(len(surface_points)),"median_spacing_m":spacing,"triangles_before_qc":int(len(tri.simplices)),"triangles_after_qc":int(len(faces)),**triangle_config,**raster_info},
+        "surface":{
+            "working_unique_xy_points":int(len(surface_points)),"median_nearest_point_spacing_m":spacing,
+            "triangles_before_qc":int(len(tri.simplices)),"triangles_after_qc":int(len(faces)),
+            "delaunay":delaunay_info,"strict_mesh":strict_mesh_info,**triangle_config,**raster_info,
+        },
         "las":{"z_definition":"z = -depth_primary_m","intensity_semantics":"unused; left zero","extra_bytes":["depth_m","beam_distance_m","quality_code","source_id"],**las_info},
         "warnings":[
             "Beam distance is treated as KoggerApp-derived primary depth and is not automatically offset by transducer draft.",
             "Bottom elevation is unavailable because vertical datum/reduction is not established.",
-            "Surface QC v2 bathymetry_depth.tiff is a presentation grid; strict engineering evidence remains bathymetry_depth_strict.tiff plus coverage_mask.tiff.",
-            "Presentation interpolation is limited to the Delaunay hull and nearest-observation radius, but is not metrological uncertainty or strict coverage evidence.",
-            "Support quality is not a metrological uncertainty surface.",
+            "Delaunay computation uses a local XY frame for numerical stability; exported geospatial products remain in the configured projected CRS.",
+            "bathymetry_depth.tiff and depth_surface_presentation.* are presentation products; strict evidence remains bathymetry_depth_strict.tiff, coverage_mask.tiff and depth_surface_strict.*.",
+            "Presentation interpolation is not metrological uncertainty or strict coverage evidence.",
+            "Survey presets are starting geometry assumptions, not accuracy claims.",
+            "Side-scan/swath reconstruction requires georeferenced across-track observations; centerline Beam distance is insufficient.",
             "Direct UM982 stream is not inferred from GPS_RAW_INT.",
         ],
     }
