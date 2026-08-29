@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import rasterio
 from bathymetry.models import ProcessingConfig
-from bathymetry.processor import run_pipeline
+from bathymetry.processor import run_pipeline, build_local_delaunay
 from bathymetry.csv_importer import import_kogger_csv
 from bathymetry.quality_control import normalize_observations
 
@@ -27,6 +27,19 @@ def test_beam_is_primary_and_zero_coordinates_rejected(tmp_path: Path) -> None:
     assert obs.loc[1,"rangefinder_raw_m"] == 0
 
 
+def test_local_delaunay_uses_large_projected_coordinates_stably() -> None:
+    gx,gy=np.meshgrid(np.linspace(0,12,13),np.linspace(0,7,8))
+    xy=np.column_stack((500000.0+gx.ravel()*0.1,6230000.0+gy.ravel()*0.1))
+    tri,local_xy,origin,info=build_local_delaunay(xy)
+    assert len(tri.simplices)>0
+    assert info["input_vertices"]==len(xy)
+    assert info["used_vertices"]==len(xy)
+    assert info["coplanar_vertices"]==0
+    assert info["all_vertices_used"] is True
+    assert np.max(np.abs(local_xy))<2.0
+    assert origin[1]>6_000_000
+
+
 def test_pipeline_creates_v02_products(tmp_path: Path) -> None:
     import pytest
     pytest.importorskip("laspy")
@@ -35,17 +48,15 @@ def test_pipeline_creates_v02_products(tmp_path: Path) -> None:
     config=ProcessingConfig(
         input_csv=input_csv,output_dir=output_dir,latitude_field="Latitude",longitude_field="Longitude",
         beam_distance_field="Beam distance",output_crs="EPSG:32637",max_triangle_edge_m=20.0,
-        # This fixture intentionally uses a large manual triangle edge. Give the presentation
-        # surface a matching explicit radius so the test validates the intended superset case
-        # instead of comparing two independently configured support thresholds.
-        max_nearest_point_distance_m=20.0,
-        pixel_size_m=0.5,max_depth_jump_m=10.0,create_project_database=True,
+        max_nearest_point_distance_m=20.0,pixel_size_m=0.5,max_depth_jump_m=10.0,create_project_database=True,
     )
     result=run_pipeline(config)
     assert result["accepted_aggregated_points"] >= 3
     required=[
         "normalized_observations.csv","accepted_points.csv","suspect_points.csv","rejected_points.csv",
-        "bottom_points.xyz","bottom_points.las","depth_surface.obj","depth_surface.stl",
+        "bottom_points.xyz","bottom_points.las",
+        "depth_surface.obj","depth_surface.stl","depth_surface_strict.obj","depth_surface_strict.stl",
+        "depth_surface_presentation.obj","depth_surface_presentation.stl",
         "bathymetry_depth.tiff","bathymetry_depth_strict.tiff","coverage_mask.tiff","presentation_mask.tiff",
         "nearest_point_distance.tiff","support_quality.tiff","triangle_quality.csv","processing_report.json",
         "processing_report.pdf","project.navimetry.sqlite","manifest.json",
@@ -62,7 +73,9 @@ def test_pipeline_creates_v02_products(tmp_path: Path) -> None:
         presentation_mask=ds.read(1).astype(bool)
     assert np.all(~strict_mask | presentation_mask)
     assert np.count_nonzero(presentation != -9999.0) >= np.count_nonzero(strict != -9999.0)
-    assert result["surface"]["surface_qc_version"] == "2"
+    assert result["surface"]["surface_qc_version"] == "3"
     assert result["surface"]["presentation_grid_is_quality_evidence"] is False
-    report=result
-    assert report["classification"]["primary_depth_source"] == "KOGGERAPP_BEAM"
+    assert result["surface"]["delaunay"]["all_vertices_used"] is True
+    assert result["surface"]["presentation_mesh"]["written"] is True
+    assert result["survey_geometry"]["selected_preset"]["key"] == "AUTO"
+    assert result["classification"]["primary_depth_source"] == "KOGGERAPP_BEAM"
