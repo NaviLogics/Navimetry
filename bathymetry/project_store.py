@@ -20,7 +20,23 @@ def initialize_database(path: Path) -> sqlite3.Connection:
     return conn
 
 def store_dataframe(conn: sqlite3.Connection, table: str, frame: pd.DataFrame, columns: list[str]) -> None:
+    """Append a DataFrame without exceeding SQLite's bound-variable limit.
+
+    pandas ``method='multi'`` generates one INSERT statement containing all
+    values from a chunk. With wide tables and a large chunksize that can exceed
+    SQLite's compile-time MAX_VARIABLE_NUMBER (commonly 999 on some builds).
+    The default method uses executemany-style inserts, so the bound-variable
+    count is only the number of columns per row and is portable across SQLite
+    builds.
+    """
     usable = [c for c in columns if c in frame.columns]
     if not usable or frame.empty:
         return
-    frame[usable].to_sql(table, conn, if_exists="append", index=False, chunksize=5000, method="multi")
+    frame[usable].to_sql(
+        table,
+        conn,
+        if_exists="append",
+        index=False,
+        chunksize=1000,
+        method=None,
+    )
