@@ -34,6 +34,7 @@ hiddenimports += [
     "bathymetry.project_store",
     "bathymetry.survey_presets",
     "bathymetry.survey_geometry",
+    "bathymetry.survey_triangle_qc",
     "PySide6.QtCore",
     "PySide6.QtGui",
     "PySide6.QtWidgets",
