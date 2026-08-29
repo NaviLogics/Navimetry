@@ -24,9 +24,6 @@ gdal_data_dir = rasterio_dir / "gdal_data"
 if (gdal_data_dir / "gdalvrt.xsd").is_file():
     datas.append((str(gdal_data_dir), "rasterio/gdal_data"))
 
-# Rasterio contains Python modules that are imported dynamically from Cython
-# extensions (for example rasterio.sample). Collect its submodules explicitly
-# so the frozen application behaves like the normal Python environment.
 hiddenimports = collect_submodules("rasterio")
 hiddenimports += collect_submodules("pyproj")
 hiddenimports += [
@@ -36,6 +33,7 @@ hiddenimports += [
     "bathymetry.matcher",
     "bathymetry.quality_control",
     "bathymetry.project_store",
+    "bathymetry.survey_presets",
     "PySide6.QtCore",
     "PySide6.QtGui",
     "PySide6.QtWidgets",
@@ -44,7 +42,6 @@ hiddenimports += [
     "scipy.spatial._qhull",
 ]
 
-# Keep test modules out of the portable distribution.
 hiddenimports = [
     name for name in dict.fromkeys(hiddenimports)
     if ".tests" not in name and not name.endswith(".tests")
