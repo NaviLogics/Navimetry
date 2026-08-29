@@ -43,9 +43,10 @@ class PipelineWorker(QObject):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Bathymetry MVP")
+        self.setWindowTitle("Navimetry 0.2 Portable")
         self.resize(920, 720)
         self.input_path: Path | None = None
+        self.klf_path: Path | None = None
         self.thread: QThread | None = None
         self.worker: PipelineWorker | None = None
         self.build_ui()
@@ -71,6 +72,21 @@ class MainWindow(QMainWindow):
             3,
         )
         layout.addWidget(input_group)
+        klf_group = QGroupBox("Исходный KLF (опционально)")
+        klf_layout = QGridLayout(klf_group)
+        self.klf_edit = QLineEdit()
+        self.klf_edit.setReadOnly(True)
+        klf_button = QPushButton("Выбрать KLF")
+        klf_button.clicked.connect(self.choose_klf)
+        clear_klf_button = QPushButton("Очистить")
+        clear_klf_button.clicked.connect(self.clear_klf)
+        klf_layout.addWidget(QLabel("Файл:"), 0, 0)
+        klf_layout.addWidget(self.klf_edit, 0, 1)
+        klf_layout.addWidget(klf_button, 0, 2)
+        klf_layout.addWidget(clear_klf_button, 0, 3)
+        self.klf_info = QLabel("KLF не выбран: CSV-only режим")
+        klf_layout.addWidget(self.klf_info, 1, 0, 1, 4)
+        layout.addWidget(klf_group)
         fields_group = QGroupBox("Поля CSV")
         fields_layout = QFormLayout(fields_group)
         self.latitude_combo = QComboBox()
@@ -102,6 +118,7 @@ class MainWindow(QMainWindow):
         self.water_surface_spin.setDecimals(3)
         self.water_surface_spin.setRange(0.0, 10.0)
         self.water_surface_spin.setValue(0.15)
+        self.water_surface_spin.setEnabled(False)
         self.water_surface_spin.setSuffix(" м")
         self.pixel_spin = QDoubleSpinBox()
         self.pixel_spin.setDecimals(3)
@@ -138,8 +155,7 @@ class MainWindow(QMainWindow):
             self.offset_checkbox,
         )
         parameters_layout.addRow(
-            "Поправка от поверхности воды "
-            "до трансдьюсера:",
+            "Поправка до трансдьюсера (0.2: не применяется):",
             self.water_surface_spin,
         )
         parameters_layout.addRow(
@@ -260,6 +276,29 @@ class MainWindow(QMainWindow):
             if item.strip().lower() in normalized:
                 combo.setCurrentIndex(index)
                 return
+    def choose_klf(self) -> None:
+        file_name, _ = QFileDialog.getOpenFileName(
+            self,
+            "Выбор KLF",
+            str(Path.home()),
+            "Kogger log (*.KLF *.klf);;Все файлы (*)",
+        )
+        if not file_name:
+            return
+        self.klf_path = Path(file_name)
+        self.klf_edit.setText(str(self.klf_path))
+        try:
+            size_mb = self.klf_path.stat().st_size / (1024 * 1024)
+            self.klf_info.setText(f"KLF выбран: {size_mb:.1f} MiB; будет выполнен KP2/MAVLink inventory")
+        except OSError:
+            self.klf_info.setText("KLF выбран")
+        self.append_log("KLF выбран: " + self.klf_path.name)
+
+    def clear_klf(self) -> None:
+        self.klf_path = None
+        self.klf_edit.clear()
+        self.klf_info.setText("KLF не выбран: CSV-only режим")
+
     def choose_output_dir(self) -> None:
         directory = QFileDialog.getExistingDirectory(
             self,
@@ -304,11 +343,12 @@ class MainWindow(QMainWindow):
                 self.output_edit.text()
             ).expanduser()
             job_name = datetime.now().strftime(
-                "bathymetry_%Y%m%d_%H%M%S"
+                "navimetry_%Y%m%d_%H%M%S"
             )
             config = ProcessingConfig(
                 input_csv=self.input_path,
                 output_dir=base_output / job_name,
+                input_klf=self.klf_path,
                 latitude_field=(
                     self.latitude_combo.currentText()
                 ),
@@ -327,9 +367,11 @@ class MainWindow(QMainWindow):
                 source_gnss_transducer_offset_applied=(
                     self.offset_checkbox.isChecked()
                 ),
+                apply_vertical_correction=False,
                 water_surface_to_transducer_m=float(
                     self.water_surface_spin.value()
                 ),
+                vertical_reduction_mode="NONE",
                 pixel_size_m=(
                     self.pixel_spin.value() or None
                 ),
