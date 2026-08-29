@@ -20,7 +20,9 @@ def run_self_test() -> int:
         from bathymetry.clock_sync import build_clock_model  # noqa: F401
         from bathymetry.matcher import match_csv_to_klf  # noqa: F401
         from bathymetry.quality_control import normalize_observations  # noqa: F401
-        from bathymetry.processor import run_pipeline  # noqa: F401
+        from bathymetry.processor import run_pipeline, build_local_delaunay  # noqa: F401
+        from bathymetry.survey_presets import get_survey_preset  # noqa: F401
+        assert get_survey_preset("AUTO").key == "AUTO"
         import numpy  # noqa: F401
         import pandas  # noqa: F401
         import scipy  # noqa: F401
