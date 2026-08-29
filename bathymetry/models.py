@@ -54,6 +54,12 @@ class ProcessingConfig:
     generate_quality_proxy: bool = True
     aggregation_mode: str = "none"
     create_project_database: bool = True
+    # Survey-geometry groundwork. Presets are explicit starting values, not accuracy claims.
+    survey_preset: str = "AUTO"
+    survey_geometry: str = "single_beam_centerline"
+    expected_line_spacing_m: float | None = None
+    swath_half_width_m: float | None = None
+    has_georeferenced_swath_points: bool = False
 
 @dataclass
 class Observation:
