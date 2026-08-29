@@ -37,10 +37,13 @@ def _synthetic_tracks() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def test_track_segmentation_estimates_line_spacing_and_surface_centers() -> None:
+def test_track_segmentation_estimates_finite_line_corridors() -> None:
     summary,tracks=estimate_track_geometry(_synthetic_tracks())
     assert summary["status"]=="estimated"; assert summary["detected_segments"]>=4; assert summary["distinct_line_clusters"]>=4; assert abs(summary["estimated_line_spacing_m"]-5.0)<0.25; assert not tracks.empty
-    assert len(summary["line_centers_surface_cross_track_m"])>=4; assert summary["surface_reference_mode"]=="mean_of_exact_unique_surface_xy"
+    assert summary["geometry_version"]=="2"; assert summary["corridor_model"]=="finite_along_track_extent"; assert len(summary["line_corridors_surface_local"])>=4
+    for corridor in summary["line_corridors_surface_local"]:
+        assert corridor["along_track_max_m"]>corridor["along_track_min_m"]; assert corridor["segment_count"]>=1
+    assert "survey_line_id" in tracks.columns; assert "surface_along_track_min_m" in tracks.columns
 
 
 def test_auto_preset_uses_estimated_spacing_not_point_spacing(tmp_path: Path) -> None:
@@ -48,18 +51,34 @@ def test_auto_preset_uses_estimated_spacing_not_point_spacing(tmp_path: Path) ->
     assert effective["line_spacing_source"]=="estimated_from_track_segments"; assert abs(effective["strict_max_triangle_edge_m"]-6.75)<1e-9; assert abs(effective["presentation_radius_m"]-3.75)<1e-9; assert effective["strict_cross_track_factor"]==1.35; assert effective["strict_along_track_factor"]==2.0
 
 
-def test_topology_qc_accepts_adjacent_and_rejects_nonadjacent(tmp_path: Path) -> None:
-    # Local surface frame: three parallel lines at y=-5, 0, +5 m. Triangle 0 bridges
-    # adjacent lines; triangle 1 bridges line 0 directly to line 2. Both fit a permissive
-    # anisotropic envelope, so the second rejection must come from topology, not max span.
-    xy=np.array([[0.00,-5.0],[0.02,-5.0],[0.00,0.0],[1.00,-5.0],[1.02,-5.0],[1.00,5.0]],dtype=float)
-    depth=np.array([2.0,2.01,2.1,2.0,2.01,2.2],dtype=float); faces=np.array([[0,1,2],[3,4,5]],dtype=np.int64); metrics=triangle_metrics(xy,depth,faces)
+def _track_corridors():
+    return {"dominant_axis_heading_deg":0.0,"line_corridors_surface_local":[
+        {"survey_line_id":0,"cross_track_center_m":-5.0,"along_track_min_m":-10.0,"along_track_max_m":10.0},
+        {"survey_line_id":1,"cross_track_center_m":0.0,"along_track_min_m":-10.0,"along_track_max_m":10.0},
+        {"survey_line_id":2,"cross_track_center_m":5.0,"along_track_min_m":-10.0,"along_track_max_m":10.0},
+    ]}
+
+
+def test_topology_v3_accepts_adjacent_and_rejects_nonadjacent(tmp_path: Path) -> None:
+    xy=np.array([[0.00,-5.0],[0.02,-5.0],[0.00,0.0],[1.00,-5.0],[1.02,-5.0],[1.00,5.0]],dtype=float); depth=np.array([2.0,2.01,2.1,2.0,2.01,2.2],dtype=float); faces=np.array([[0,1,2],[3,4,5]],dtype=np.int64); metrics=triangle_metrics(xy,depth,faces)
     cfg=ProcessingConfig(input_csv=tmp_path/"x.csv",output_dir=tmp_path/"out",max_triangle_angle_deg=179.99)
     effective={"effective_line_spacing_m":5.0,"geometry":"single_beam_centerline","strict_cross_track_factor":2.5,"strict_along_track_factor":2.0,"cross_line_threshold_factor":0.25,"strict_max_triangle_edge_m":12.5,"strict_max_triangle_edge_source":"line_spacing_x_2.500"}
-    track={"dominant_axis_heading_deg":0.0,"line_centers_surface_cross_track_m":[-5.0,0.0,5.0]}
-    accepted,info=evaluate_triangles(metrics,xy,faces,cfg,0.02,effective,track)
-    assert accepted.tolist()==[0]; assert info["triangle_qc_mode"]=="survey_aware_topology_v2"; assert info["triangle_qc_version"]=="survey-aware-v2"; assert info["aspect_ratio_used_as_rejection"] is False
-    assert metrics.loc[0,"line_topology"]=="adjacent_lines"; assert metrics.loc[1,"line_topology"]=="non_adjacent_lines"; assert bool(metrics.loc[1,"fails_line_topology"]); assert info["rejection_counts"]["line_topology"]==1
+    accepted,info=evaluate_triangles(metrics,xy,faces,cfg,0.02,effective,_track_corridors())
+    assert accepted.tolist()==[0]; assert info["triangle_qc_mode"]=="survey_aware_finite_corridor_v3"; assert info["triangle_qc_version"]=="survey-aware-v3"; assert info["aspect_ratio_used_as_rejection"] is False
+    assert metrics.loc[0,"line_topology"]=="adjacent_lines"; assert metrics.loc[1,"line_topology"]=="non_adjacent_lines"; assert bool(metrics.loc[1,"fails_line_topology"])
+
+
+def test_topology_v3_marks_finite_line_endpoint_transition(tmp_path: Path) -> None:
+    # All vertices are cross-track-close to line 0, but one lies 1 m beyond its finite end.
+    # With spacing 5 m the endpoint margin is 2.5 m, so this is an endpoint transition,
+    # not a confident same-line observation and not a generic offline point.
+    xy=np.array([[9.8,-5.0],[10.0,-5.0],[11.0,-5.0]],dtype=float); depth=np.array([2.0,2.01,2.02]); faces=np.array([[0,1,2]],dtype=np.int64); metrics=triangle_metrics(xy,depth,faces)
+    cfg=ProcessingConfig(input_csv=tmp_path/"x.csv",output_dir=tmp_path/"out",max_triangle_angle_deg=179.99,min_triangle_area_m2=0.0)
+    effective={"effective_line_spacing_m":5.0,"geometry":"single_beam_centerline","strict_cross_track_factor":1.35,"strict_along_track_factor":2.0,"cross_line_threshold_factor":0.25}
+    # Make the triangle non-collinear while retaining the endpoint case.
+    xy[1,1]=-4.98; metrics=triangle_metrics(xy,depth,faces)
+    accepted,info=evaluate_triangles(metrics,xy,faces,cfg,0.02,effective,_track_corridors())
+    assert metrics.loc[0,"line_topology"]=="line_endpoint_transition"; assert metrics.loc[0,"v2_membership_state"]=="endpoint_transition"; assert info["line_membership"]["endpoint_transition_vertices"]>=1
 
 
 def test_pipeline_creates_v02_products(tmp_path: Path) -> None:
@@ -76,4 +95,4 @@ def test_pipeline_creates_v02_products(tmp_path: Path) -> None:
     with rasterio.open(output_dir/"presentation_mask.tiff") as ds: presentation_mask=ds.read(1).astype(bool)
     assert np.all(~strict_mask|presentation_mask); assert np.count_nonzero(presentation!=-9999.0)>=np.count_nonzero(strict!=-9999.0)
     assert result["surface"]["surface_qc_version"]=="5"; assert result["surface"]["presentation_grid_is_quality_evidence"] is False; assert result["surface"]["delaunay"]["all_vertices_used"] is True; assert result["surface"]["presentation_mesh"]["written"] is True
-    assert result["surface"]["triangle_qc"]["triangle_qc_version"]=="survey-aware-v2"; assert result["survey_geometry"]["version"]=="1"; assert result["survey_geometry"]["selected_preset"]["key"]=="AUTO"; assert result["classification"]["primary_depth_source"]=="KOGGERAPP_BEAM"
+    assert result["surface"]["triangle_qc"]["triangle_qc_version"]=="survey-aware-v3"; assert result["survey_geometry"]["selected_preset"]["key"]=="AUTO"; assert result["classification"]["primary_depth_source"]=="KOGGERAPP_BEAM"
