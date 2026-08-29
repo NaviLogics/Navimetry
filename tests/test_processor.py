@@ -35,6 +35,10 @@ def test_pipeline_creates_v02_products(tmp_path: Path) -> None:
     config=ProcessingConfig(
         input_csv=input_csv,output_dir=output_dir,latitude_field="Latitude",longitude_field="Longitude",
         beam_distance_field="Beam distance",output_crs="EPSG:32637",max_triangle_edge_m=20.0,
+        # This fixture intentionally uses a large manual triangle edge. Give the presentation
+        # surface a matching explicit radius so the test validates the intended superset case
+        # instead of comparing two independently configured support thresholds.
+        max_nearest_point_distance_m=20.0,
         pixel_size_m=0.5,max_depth_jump_m=10.0,create_project_database=True,
     )
     result=run_pipeline(config)
