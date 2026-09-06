@@ -1,0 +1,4 @@
+[submodule "upstream/KoggerApp"]
+	path = upstream/KoggerApp
+	url = https://github.com/koggertech/KoggerApp.git
+	branch = master
