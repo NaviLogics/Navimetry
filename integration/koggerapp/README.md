@@ -1,34 +1,48 @@
-# Navimetry unified integration skeleton
+# Navimetry × KoggerApp integration skeleton
 
-This directory is the first integration skeleton for the future unified **Navimetry** application based on KoggerApp.
+This branch is the first non-destructive integration milestone for the future unified **Navimetry** application.
 
-## Upstream baseline
+## Pinned upstream
 
-- Upstream: `koggertech/KoggerApp`
-- Baseline branch: `master`
-- Baseline commit reviewed for this skeleton: `4615cc88dcb865134d973bf132034ff6f41dbb57`
-- Upstream application architecture: C++23 + Qt 6.8/QML + CMake.
+- KoggerApp repository: `https://github.com/koggertech/KoggerApp`
+- upstream branch: `master`
+- pinned commit: `4615cc88dcb865134d973bf132034ff6f41dbb57`
+- implementation: C++23 + Qt 6.8/QML + CMake.
 
-## Target architecture
+The branch keeps the existing Navimetry Python implementation untouched as the reference bathymetry/QC engine and mounts KoggerApp as `upstream/KoggerApp` via a Git submodule. This avoids copying or rewriting upstream history while field calibration of Survey-aware QC continues.
 
-KoggerApp becomes the acquisition / device / visualization shell. The existing Navimetry Python implementation remains the reference bathymetric-processing and QC engine until the release mathematics is frozen and ported or embedded deliberately.
+## What the skeleton does
 
-Initial UI target:
+`apply_skeleton.py` applies an intentionally small, auditable overlay to the pinned KoggerApp checkout:
 
-- existing KoggerApp functionality remains intact;
-- application branding becomes **Navimetry**;
-- a new top-level bathymetry entry opens **Navimetry Processing**;
-- the processing page is intentionally a placeholder in this skeleton and does not call the Python engine yet.
+1. visible application brand becomes **Navimetry**;
+2. generated desktop executable is named `Navimetry` while the internal CMake target remains `KoggerApp` to minimize first-stage churn;
+3. a desktop menu **Bathymetry** is added;
+4. **Bathymetry → Navimetry Processing** opens a placeholder page;
+5. no Navimetry processing algorithm is connected yet;
+6. KoggerApp acquisition, device control, echogram, map and visualization code are otherwise untouched.
 
-## Files in this overlay
+## Try the skeleton locally
 
-- `qml/NavimetryProcessingPage.qml` — empty Bathymetry / Navimetry Processing page.
-- `qml/NavimetryBathymetryButton.qml` — simple navigation button suitable for insertion into the existing KoggerApp navigation area.
-- `apply_skeleton.py` — idempotent patch helper for a clean KoggerApp checkout. It performs text rebranding in the main CMake/QML entry points and installs the placeholder QML files.
-- `INTEGRATION_NOTES.md` — exact next integration steps and invariants.
+```bash
+git checkout navimetry-unified-koggerapp
+git submodule update --init --recursive
+python integration/koggerapp/apply_skeleton.py
+```
 
-## Important
+Then open `upstream/KoggerApp/CMakeLists.txt` in Qt Creator and build with the normal KoggerApp toolchain. The overlay edits the submodule working tree only; rerun after resetting the submodule if you want a clean reproduction.
 
-This branch intentionally does **not** replace the current `navimetry-0.2` processing implementation and does not merge into `main`. It is an integration overlay until a writable NaviLogics fork of KoggerApp exists in GitHub. Once such a fork exists, this overlay should be applied there and the resulting KoggerApp-derived source tree should become the real unified branch.
+## Branding asset
 
-The KoggerApp GPLv3 license and upstream attribution must remain in the unified application. Vendor permission for branding/use is complementary to, not a replacement for, the source license obligations.
+This milestone changes the textual/application brand and prepares the unified UI entry point. A final Navimetry logo/icon has **not** been fabricated here. When the approved Navimetry logo asset is supplied, replace the KoggerApp image/icon resources in a separate branding commit so visual branding remains traceable.
+
+## Architecture invariant
+
+**KoggerApp = acquisition/device/visualization shell.**  
+**Navimetry = bathymetry, survey geometry, Survey-aware QC, surface generation and engineering export engine.**
+
+The next integration milestone should connect the stabilized Navimetry engine behind the placeholder page through a narrow processing interface, not duplicate KLF parsing or device acquisition logic prematurely.
+
+## Licensing / attribution
+
+KoggerApp's existing GPLv3 license and upstream notices remain applicable to the KoggerApp-derived application. The vendor's separate permission for branding/use is compatible with this integration approach; keep the upstream license and attribution visible in the unified product.
