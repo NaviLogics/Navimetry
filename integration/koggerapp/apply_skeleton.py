@@ -9,6 +9,7 @@ import subprocess
 from pathlib import Path
 
 BASELINE = "4615cc88dcb865134d973bf132034ff6f41dbb57"
+NL = chr(10)
 
 PAGE = '''import QtQuick 2.15
 import QtQuick.Controls 2.15
@@ -126,7 +127,7 @@ def main() -> int:
                  "project(Navimetry VERSION ${KOGGER_VERSION} LANGUAGES CXX)")
     replace_once(cmake,
                  "target_compile_features(KoggerApp PRIVATE cxx_std_23)",
-                 'set_target_properties(KoggerApp PROPERTIES OUTPUT_NAME "Navimetry")\n\ntarget_compile_features(KoggerApp PRIVATE cxx_std_23)')
+                 'set_target_properties(KoggerApp PROPERTIES OUTPUT_NAME "Navimetry")' + NL + NL + 'target_compile_features(KoggerApp PRIVATE cxx_std_23)')
 
     main_cpp = upstream / "src" / "main.cpp"
     replace_once(main_cpp,
@@ -136,10 +137,10 @@ def main() -> int:
     app_cmake = upstream / "qml" / "app" / "CMakeLists.txt"
     text = app_cmake.read_text(encoding="utf-8")
     if "NavimetryProcessingPage.qml" not in text:
-        marker = "        MainWindow.qml\n"
+        marker = "        MainWindow.qml" + NL
         if marker not in text:
             raise RuntimeError("MainWindow.qml marker not found in qml/app/CMakeLists.txt")
-        app_cmake.write_text(text.replace(marker, marker + "        NavimetryProcessingPage.qml\n", 1), encoding="utf-8")
+        app_cmake.write_text(text.replace(marker, marker + "        NavimetryProcessingPage.qml" + NL, 1), encoding="utf-8")
 
     qml = upstream / "qml" / "app" / "MainWindow.qml"
     text = qml.read_text(encoding="utf-8")
@@ -148,7 +149,7 @@ def main() -> int:
     text = text.replace('core.fileTitle + " — KoggerApp, KOGGER" : qsTr("KoggerApp, KOGGER"))',
                         'core.fileTitle + " — Navimetry" : qsTr("Navimetry"))')
     if "id: navimetryProcessingPopup" not in text:
-        marker = "    onActiveChanged: if (active) root.lastActiveWindow = root\n"
+        marker = "    onActiveChanged: if (active) root.lastActiveWindow = root" + NL
         if marker not in text:
             raise RuntimeError("MainWindow insertion marker not found")
         text = text.replace(marker, marker + MENU_BLOCK, 1)
