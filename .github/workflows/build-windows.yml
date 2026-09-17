@@ -62,6 +62,7 @@ jobs:
           cache: pip
           cache-dependency-path: requirements-build.txt
 
+      # Field build supports edited CSV subsets by preserving the source Number identity.
       - name: Prepare integrated field pipeline
         shell: pwsh
         run: python tools/prepare_field_build.py
@@ -133,6 +134,7 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          
         run: |
           $version = "${{ github.ref_name }}"
           $archive = Get-ChildItem -Path release-assets -Filter "*.zip" -Recurse | Select-Object -First 1
