@@ -31,6 +31,9 @@ jobs:
           architecture: x64
           cache: pip
           cache-dependency-path: requirements-build.txt
+      - name: Prepare integrated field pipeline
+        shell: pwsh
+        run: python tools/prepare_field_build.py
       - name: Install dependencies
         shell: pwsh
         run: |
@@ -58,6 +61,10 @@ jobs:
           architecture: x64
           cache: pip
           cache-dependency-path: requirements-build.txt
+
+      - name: Prepare integrated field pipeline
+        shell: pwsh
+        run: python tools/prepare_field_build.py
 
       - name: Build portable distribution
         shell: cmd
