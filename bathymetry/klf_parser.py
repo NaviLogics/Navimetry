@@ -13,7 +13,7 @@ class KlfInventory:
     path:str; size_bytes:int; complete_frames:int=0; incomplete_frames:int=0; checksum_errors:int=0; direct_kogger_frames:int=0; mavlink_proxy_frames:int=0; mavlink_v1_frames:int=0; id_counts:dict[int,int]=field(default_factory=dict); acoustic_cycle_starts:int=0; complete_five_fragment_cycles:int=0; sonar_frequency_hz:float|None=None; mavlink_sequence_missing_positions:int=0; mavlink_sequence_gap_events:int=0; direct_um982_stream_detected:bool=False; master_slave_separation_proven:bool=False
 @dataclass
 class KlfParseResult:
-    inventory:KlfInventory; mavlink_inventory:pd.DataFrame; global_position:pd.DataFrame; gps_raw:pd.DataFrame; attitude:pd.DataFrame; estimator_status:pd.DataFrame; system_time:pd.DataFrame; frame_records:list[dict]; mavlink_records:list[dict]
+    inventory:KlfInventory; mavlink_inventory:pd.DataFrame; global_position:pd.DataFrame; gps_raw:pd.DataFrame; attitude:pd.DataFrame; estimator_status:pd.DataFrame; system_time:pd.DataFrame; sonar_cycles:pd.DataFrame; frame_records:list[dict]; mavlink_records:list[dict]
 def _fletcher_ok(frame:bytes)->bool:
     a=b=0
     for value in frame[2:-2]: a=(a+value)&255; b=(b+a)&255
@@ -34,7 +34,7 @@ def _frequency_stats(times_ms:list[int])->dict:
     t=np.asarray(times_ms,dtype=float)/1000; dt=np.diff(t); duration=float(t[-1]-t[0]); return {"duration_s":duration,"mean_frequency_hz":(len(t)-1)/duration if duration>0 else None,"median_interval_s":float(np.median(dt)),"p95_interval_s":float(np.percentile(dt,95)),"max_interval_s":float(np.max(dt))}
 def inspect_klf(path:Path,capture_records:bool=True)->KlfParseResult:
     if not path.exists() or not path.is_file(): raise KlfParseError(f"KLF not found: {path}")
-    data=path.read_bytes(); pos=0; frame_index=0; checksum_errors=0; incomplete=0; direct=proxy_count=mav_v1=0; id_counts=Counter(); chart_patterns=Counter(); current_chart=None; ping_times=[]; mav_by_id=defaultdict(list); seqs=[]; gpi=[]; gps=[]; attitude=[]; estimator=[]; systime=[]; frame_records=[]; mav_records=[]
+    data=path.read_bytes(); pos=0; frame_index=0; checksum_errors=0; incomplete=0; direct=proxy_count=mav_v1=0; id_counts=Counter(); chart_patterns=Counter(); current_chart=None; ping_times=[]; sonar=[]; mav_by_id=defaultdict(list); seqs=[]; gpi=[]; gps=[]; attitude=[]; estimator=[]; systime=[]; frame_records=[]; mav_records=[]
     while pos<len(data):
         if pos+4>len(data): incomplete+=1; break
         if data[pos:pos+2]!=b"\xCC\x55":
@@ -73,7 +73,8 @@ def inspect_klf(path:Path,capture_records:bool=True)->KlfParseResult:
                     if sequence_offset==0:
                         if current_chart is not None:chart_patterns[tuple(current_chart)]+=1
                         current_chart=[]
-                        if decoded.get("ltime_ms") is not None:ping_times.append(decoded["ltime_ms"])
+                        if decoded.get("ltime_ms") is not None:
+                            ping_times.append(decoded["ltime_ms"]); sonar.append((len(sonar),frame_index,decoded["ltime_ms"]))
                     if current_chart is not None:current_chart.append(sequence_offset)
         pos+=frame_len
     if current_chart is not None:chart_patterns[tuple(current_chart)]+=1
@@ -85,4 +86,5 @@ def inspect_klf(path:Path,capture_records:bool=True)->KlfParseResult:
     att_df=pd.DataFrame(attitude,columns=["frame_index","kogger_ltime_ms","px4_boot_time_ms","roll_rad","pitch_rad","yaw_rad"])
     est_df=pd.DataFrame(estimator,columns=["frame_index","kogger_ltime_ms","time_usec","vel_ratio","pos_horiz_ratio","pos_vert_ratio","mag_ratio","hagl_ratio","tas_ratio","pos_horiz_accuracy_m","pos_vert_accuracy_m","solution_status_flags"])
     st_df=pd.DataFrame(systime,columns=["frame_index","kogger_ltime_ms","time_unix_usec","px4_boot_time_ms"])
-    return KlfParseResult(inventory,pd.DataFrame(rows),gpi_df,gps_df,att_df,est_df,st_df,frame_records,mav_records)
+    sonar_df=pd.DataFrame(sonar,columns=["sonar_cycle_index","frame_index","kogger_ltime_ms"])
+    return KlfParseResult(inventory,pd.DataFrame(rows),gpi_df,gps_df,att_df,est_df,st_df,sonar_df,frame_records,mav_records)
