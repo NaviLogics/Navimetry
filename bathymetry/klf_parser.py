@@ -13,7 +13,7 @@ class KlfInventory:
     path:str; size_bytes:int; complete_frames:int=0; incomplete_frames:int=0; checksum_errors:int=0; direct_kogger_frames:int=0; mavlink_proxy_frames:int=0; mavlink_v1_frames:int=0; id_counts:dict[int,int]=field(default_factory=dict); acoustic_cycle_starts:int=0; complete_five_fragment_cycles:int=0; sonar_frequency_hz:float|None=None; mavlink_sequence_missing_positions:int=0; mavlink_sequence_gap_events:int=0; direct_um982_stream_detected:bool=False; master_slave_separation_proven:bool=False
 @dataclass
 class KlfParseResult:
-    inventory:KlfInventory; mavlink_inventory:pd.DataFrame; global_position:pd.DataFrame; gps_raw:pd.DataFrame; attitude:pd.DataFrame; frame_records:list[dict]; mavlink_records:list[dict]
+    inventory:KlfInventory; mavlink_inventory:pd.DataFrame; global_position:pd.DataFrame; gps_raw:pd.DataFrame; attitude:pd.DataFrame; estimator_status:pd.DataFrame; system_time:pd.DataFrame; frame_records:list[dict]; mavlink_records:list[dict]
 def _fletcher_ok(frame:bytes)->bool:
     a=b=0
     for value in frame[2:-2]: a=(a+value)&255; b=(b+a)&255
@@ -34,7 +34,7 @@ def _frequency_stats(times_ms:list[int])->dict:
     t=np.asarray(times_ms,dtype=float)/1000; dt=np.diff(t); duration=float(t[-1]-t[0]); return {"duration_s":duration,"mean_frequency_hz":(len(t)-1)/duration if duration>0 else None,"median_interval_s":float(np.median(dt)),"p95_interval_s":float(np.percentile(dt,95)),"max_interval_s":float(np.max(dt))}
 def inspect_klf(path:Path,capture_records:bool=True)->KlfParseResult:
     if not path.exists() or not path.is_file(): raise KlfParseError(f"KLF not found: {path}")
-    data=path.read_bytes(); pos=0; frame_index=0; checksum_errors=0; incomplete=0; direct=proxy_count=mav_v1=0; id_counts=Counter(); chart_patterns=Counter(); current_chart=None; ping_times=[]; mav_by_id=defaultdict(list); seqs=[]; gpi=[]; gps=[]; attitude=[]; frame_records=[]; mav_records=[]
+    data=path.read_bytes(); pos=0; frame_index=0; checksum_errors=0; incomplete=0; direct=proxy_count=mav_v1=0; id_counts=Counter(); chart_patterns=Counter(); current_chart=None; ping_times=[]; mav_by_id=defaultdict(list); seqs=[]; gpi=[]; gps=[]; attitude=[]; estimator=[]; systime=[]; frame_records=[]; mav_records=[]
     while pos<len(data):
         if pos+4>len(data): incomplete+=1; break
         if data[pos:pos+2]!=b"\xCC\x55":
@@ -58,7 +58,10 @@ def inspect_klf(path:Path,capture_records:bool=True)->KlfParseResult:
                     time_usec,lat,lon,alt,eph,epv,vel,cog,fix,sats=struct.unpack_from("<QiiiHHHHBB",payload,0); gps.append((frame_index,ltime,time_usec,lat/1e7,lon/1e7,alt/1000,eph,epv,vel/100,cog/100,fix,sats))
                 elif msgid==30 and len(payload)>=28:
                     tb,roll,pitch,yaw,rs,ps,ys=struct.unpack_from("<Iffffff",payload,0); px4_boot=tb; attitude.append((frame_index,ltime,tb,roll,pitch,yaw))
-                elif msgid==2 and len(payload)>=12: utc_us,px4_boot=struct.unpack_from("<QI",payload,0)
+                elif msgid==230 and len(payload)>=42:
+                    time_usec=struct.unpack_from("<Q",payload,0)[0]; vals=struct.unpack_from("<ffffffffH",payload,8); px4_boot=time_usec/1000.0; estimator.append((frame_index,ltime,time_usec,*vals))
+                elif msgid==2 and len(payload)>=12:
+                    utc_us,px4_boot=struct.unpack_from("<QI",payload,0); systime.append((frame_index,ltime,utc_us,px4_boot))
                 if capture_records:mav_records.append({"frame_index":frame_index,"msgid":msgid,"message":MAVLINK_NAMES.get(msgid,f"ID_{msgid}"),"sequence":sequence,"sysid":sysid,"compid":compid,"ltime_ms":ltime,"px4_boot_time_ms":px4_boot,"utc_time_us":utc_us})
         else:
             direct+=1; kid=decoded.get("id")
@@ -77,5 +80,9 @@ def inspect_klf(path:Path,capture_records:bool=True)->KlfParseResult:
     gap_sizes=[(b-a)%256-1 for a,b in zip(seqs[:-1],seqs[1:]) if (b-a)%256>1]
     rows=[{"msgid":msgid,"message":MAVLINK_NAMES.get(msgid,f"ID_{msgid}"),"count":len(times),**_frequency_stats(times)} for msgid,times in sorted(mav_by_id.items())]
     sonar_stats=_frequency_stats(ping_times); inventory=KlfInventory(str(path),len(data),frame_index,incomplete,checksum_errors,direct,proxy_count,mav_v1,dict(id_counts),len(ping_times),chart_patterns.get((0,200,400,600,800),0),sonar_stats["mean_frequency_hz"],int(sum(gap_sizes)),len(gap_sizes),False,False)
-    gpi_df=pd.DataFrame(gpi,columns=["frame_index","kogger_ltime_ms","px4_boot_time_ms","latitude_deg","longitude_deg","altitude_m","vx_mps","vy_mps","vz_mps"]); gps_df=pd.DataFrame(gps,columns=["frame_index","kogger_ltime_ms","time_usec","latitude_deg","longitude_deg","altitude_m","eph","epv","velocity_mps","cog_deg","fix_type","satellites"]); att_df=pd.DataFrame(attitude,columns=["frame_index","kogger_ltime_ms","px4_boot_time_ms","roll_rad","pitch_rad","yaw_rad"])
-    return KlfParseResult(inventory,pd.DataFrame(rows),gpi_df,gps_df,att_df,frame_records,mav_records)
+    gpi_df=pd.DataFrame(gpi,columns=["frame_index","kogger_ltime_ms","px4_boot_time_ms","latitude_deg","longitude_deg","altitude_m","vx_mps","vy_mps","vz_mps"])
+    gps_df=pd.DataFrame(gps,columns=["frame_index","kogger_ltime_ms","time_usec","latitude_deg","longitude_deg","altitude_m","eph","epv","velocity_mps","cog_deg","fix_type","satellites"])
+    att_df=pd.DataFrame(attitude,columns=["frame_index","kogger_ltime_ms","px4_boot_time_ms","roll_rad","pitch_rad","yaw_rad"])
+    est_df=pd.DataFrame(estimator,columns=["frame_index","kogger_ltime_ms","time_usec","vel_ratio","pos_horiz_ratio","pos_vert_ratio","mag_ratio","hagl_ratio","tas_ratio","pos_horiz_accuracy_m","pos_vert_accuracy_m","solution_status_flags"])
+    st_df=pd.DataFrame(systime,columns=["frame_index","kogger_ltime_ms","time_unix_usec","px4_boot_time_ms"])
+    return KlfParseResult(inventory,pd.DataFrame(rows),gpi_df,gps_df,att_df,est_df,st_df,frame_records,mav_records)
