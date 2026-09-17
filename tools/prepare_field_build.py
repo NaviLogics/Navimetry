@@ -36,11 +36,11 @@ processor = replace_once(
     '',
     "remove QC contour from customer map",
 )
-processor = replace_once(processor, 'fig.colorbar(im,ax=ax,shrink=.8,label="Depth, m"); ax.set_title("Navimetry 0.2 Surface QC v5 — survey-aware bathymetric grid"); ax.set_xlabel("X, m"); ax.set_ylabel("Y, m")', 'fig.colorbar(im,ax=ax,shrink=.8,label="Глубина, м"); ax.set_title("Navimetry — батиметрическая карта"); ax.set_xlabel("X, м"); ax.set_ylabel("Y, м")', "Russian map labels")
+processor = replace_once(processor, 'fig.colorbar(im,ax=ax,shrink=.8,label="Depth, m"); ax.set_title("Navimetry — standard GIS/TIN bathymetric grid"); ax.set_xlabel("X, m"); ax.set_ylabel("Y, m")', 'fig.colorbar(im,ax=ax,shrink=.8,label="Глубина, м"); ax.set_title("Navimetry — батиметрическая карта"); ax.set_xlabel("X, м"); ax.set_ylabel("Y, м")', "Russian map labels")
 processor = replace_once(processor, 'line_text="unavailable" if line_spacing is None else f"{line_spacing:.2f} m"', 'line_text="нет данных" if line_spacing is None else f"{line_spacing:.2f} м"', "Russian line spacing")
 processor = replace_once(
     processor,
-    'ax.text(.01,.01,f"CRS: {output_crs}\\nDepth source: KOGGERAPP_BEAM\\nVertical datum: unknown\\nPixel: {pixel_size:.3f} m\\nEffective line spacing: {line_text}\\nPresentation radius: {radius:.2f} m\\nStrict coverage: survey-aware triangle QC",transform=ax.transAxes,fontsize=8,va="bottom",bbox={"facecolor":"white","alpha":.8,"edgecolor":"gray"})',
+    'ax.text(.01,.01,f"CRS: {output_crs}\\nDepth source: KOGGERAPP_BEAM\\nVertical datum: unknown\\nPixel: {pixel_size:.3f} m\\nEffective line spacing: {line_text}\\nPresentation radius: {radius:.2f} m\\nSurface: linear Delaunay TIN + maximum edge gap limit",transform=ax.transAxes,fontsize=8,va="bottom",bbox={"facecolor":"white","alpha":.8,"edgecolor":"gray"})',
     'ax.text(.01,.01,f"Система координат: {output_crs}\\nИсточник глубины: эхолот\\nВертикальная система: не задана\\nРазмер ячейки: {pixel_size:.3f} м\\nРасстояние между галсами: {line_text}\\nПокрытие: только область, поддержанная измерениями",transform=ax.transAxes,fontsize=8,va="bottom",bbox={"facecolor":"white","alpha":.8,"edgecolor":"gray"}); ax.annotate("N",xy=(.94,.88),xytext=(.94,.76),xycoords="axes fraction",textcoords="axes fraction",ha="center",va="center",fontsize=11,fontweight="bold",arrowprops={"arrowstyle":"-|>","lw":1.2}); span=max(east-west,pixel_size); raw=span/5.0; power=10.0**math.floor(math.log10(raw)); scaled=raw/power; scale=(1.0 if scaled<1.5 else 2.0 if scaled<3.5 else 5.0)*power; sx1=east-0.05*span; sx0=sx1-scale; sy=south+0.05*(north-south); ax.plot([sx0,sx1],[sy,sy],linewidth=2); ax.plot([sx0,sx0],[sy-0.005*(north-south),sy+0.005*(north-south)],linewidth=1); ax.plot([sx1,sx1],[sy-0.005*(north-south),sy+0.005*(north-south)],linewidth=1); ax.text((sx0+sx1)/2,sy+0.012*(north-south),f"{scale:g} м",ha="center",va="bottom",fontsize=8)',
     "Russian customer annotation, north arrow and scale bar",
 )
@@ -64,7 +64,7 @@ validator = '''\n\ndef validate_delivery_products(points: pd.DataFrame, output_d
 processor = replace_once(processor, '\n\ndef _store_project_database(', validator+'\n\ndef _store_project_database(', "delivery validator")
 processor = replace_once(
     processor,
-    'notify("Write Surface QC v5 strict/presentation GeoTIFF, presentation OBJ/STL and PDF"); raster_info=write_surface_products(surface_points,tri,local_xy,local_origin,accepted_indices,pixel,config.output_dir,config.output_crs,config,point_spacing,effective_geometry)\n\n    klf_inv=',
+    'notify("Write standard GIS/TIN GeoTIFF, OBJ/STL and PDF"); raster_info=write_surface_products(surface_points,tri,local_xy,local_origin,accepted_indices,pixel,config.output_dir,config.output_crs,config,point_spacing,effective_geometry)\n\n    klf_inv=',
     'notify("Write Surface QC v5 strict/presentation GeoTIFF, presentation OBJ/STL and PDF"); raster_info=write_surface_products(surface_points,tri,local_xy,local_origin,accepted_indices,pixel,config.output_dir,config.output_crs,config,point_spacing,effective_geometry)\n    notify("Validate customer delivery products"); delivery_validation=validate_delivery_products(surface_points,config.output_dir,config.output_crs,pixel)\n\n    klf_inv=',
     "run delivery validator",
 )
