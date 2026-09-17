@@ -54,6 +54,12 @@ class ProcessingConfig:
     generate_quality_proxy: bool = True
     aggregation_mode: str = "none"
     create_project_database: bool = True
+    # Kogger field-data QC. 0.1144 m was observed as a long no-valid-bottom
+    # sentinel in the 2026-09-17 Navis Atlas dataset. Keep configurable so
+    # other sonar/firmware combinations are not hard-coded to this value.
+    beam_invalid_sentinel_m: float | None = 0.1144
+    beam_invalid_sentinel_tolerance_m: float = 1e-6
+    beam_invalid_sentinel_min_run: int = 3
     # Survey-geometry groundwork. Presets are explicit starting values, not accuracy claims.
     survey_preset: str = "AUTO"
     survey_geometry: str = "single_beam_centerline"

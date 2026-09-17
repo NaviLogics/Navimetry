@@ -59,26 +59,34 @@ def _track_corridors():
     ]}
 
 
-def test_topology_v3_accepts_adjacent_and_rejects_nonadjacent(tmp_path: Path) -> None:
-    xy=np.array([[0.00,-5.0],[0.02,-5.0],[0.00,0.0],[1.00,-5.0],[1.02,-5.0],[1.00,5.0]],dtype=float); depth=np.array([2.0,2.01,2.1,2.0,2.01,2.2],dtype=float); faces=np.array([[0,1,2],[3,4,5]],dtype=np.int64); metrics=triangle_metrics(xy,depth,faces)
-    cfg=ProcessingConfig(input_csv=tmp_path/"x.csv",output_dir=tmp_path/"out",max_triangle_angle_deg=179.99)
-    effective={"effective_line_spacing_m":5.0,"geometry":"single_beam_centerline","strict_cross_track_factor":2.5,"strict_along_track_factor":2.0,"cross_line_threshold_factor":0.25,"strict_max_triangle_edge_m":12.5,"strict_max_triangle_edge_source":"line_spacing_x_2.500"}
+def test_standard_gis_tin_uses_max_edge_not_line_topology(tmp_path: Path) -> None:
+    xy=np.array([[0.00,-5.0],[0.02,-5.0],[0.00,0.0],[1.00,-5.0],[1.02,-5.0],[1.00,5.0]],dtype=float)
+    depth=np.array([2.0,2.01,2.1,2.0,2.01,2.2],dtype=float)
+    faces=np.array([[0,1,2],[3,4,5]],dtype=np.int64)
+    metrics=triangle_metrics(xy,depth,faces)
+    cfg=ProcessingConfig(input_csv=tmp_path/"x.csv",output_dir=tmp_path/"out",min_triangle_area_m2=0.0)
+    effective={"effective_line_spacing_m":5.0,"strict_max_triangle_edge_m":5.5,"strict_max_triangle_edge_source":"line_spacing_x_1.100"}
     accepted,info=evaluate_triangles(metrics,xy,faces,cfg,0.02,effective,_track_corridors())
-    assert accepted.tolist()==[0]; assert info["triangle_qc_mode"]=="survey_aware_finite_corridor_v3"; assert info["triangle_qc_version"]=="survey-aware-v3"; assert info["aspect_ratio_used_as_rejection"] is False
-    assert metrics.loc[0,"line_topology"]=="adjacent_lines"; assert metrics.loc[1,"line_topology"]=="non_adjacent_lines"; assert bool(metrics.loc[1,"fails_line_topology"])
+    assert accepted.tolist()==[0]
+    assert info["triangle_qc_mode"]=="delaunay_linear_max_edge"
+    assert info["triangle_qc_version"]=="standard-gis-tin-v1"
+    assert info["survey_aware_enabled"] is False
+    assert info["survey_line_topology_used_as_rejection"] is False
+    assert metrics.loc[0,"line_topology"]=="not_used"
+    assert bool(metrics.loc[1,"fails_manual_max_edge"])
 
 
-def test_topology_v3_marks_finite_line_endpoint_transition(tmp_path: Path) -> None:
-    # All vertices are cross-track-close to line 0, but one lies 1 m beyond its finite end.
-    # With spacing 5 m the endpoint margin is 2.5 m, so this is an endpoint transition,
-    # not a confident same-line observation and not a generic offline point.
-    xy=np.array([[9.8,-5.0],[10.0,-5.0],[11.0,-5.0]],dtype=float); depth=np.array([2.0,2.01,2.02]); faces=np.array([[0,1,2]],dtype=np.int64); metrics=triangle_metrics(xy,depth,faces)
-    cfg=ProcessingConfig(input_csv=tmp_path/"x.csv",output_dir=tmp_path/"out",max_triangle_angle_deg=179.99,min_triangle_area_m2=0.0)
-    effective={"effective_line_spacing_m":5.0,"geometry":"single_beam_centerline","strict_cross_track_factor":1.35,"strict_along_track_factor":2.0,"cross_line_threshold_factor":0.25}
-    # Make the triangle non-collinear while retaining the endpoint case.
-    xy[1,1]=-4.98; metrics=triangle_metrics(xy,depth,faces)
+def test_standard_gis_tin_manual_edge_override(tmp_path: Path) -> None:
+    xy=np.array([[0.0,0.0],[1.0,0.0],[0.0,1.0]],dtype=float)
+    depth=np.array([2.0,2.1,2.2],dtype=float)
+    faces=np.array([[0,1,2]],dtype=np.int64)
+    metrics=triangle_metrics(xy,depth,faces)
+    cfg=ProcessingConfig(input_csv=tmp_path/"x.csv",output_dir=tmp_path/"out",max_triangle_edge_m=2.0,min_triangle_area_m2=0.0)
+    effective={"effective_line_spacing_m":5.0,"strict_max_triangle_edge_m":0.5,"strict_max_triangle_edge_source":"line_spacing_x_0.100"}
     accepted,info=evaluate_triangles(metrics,xy,faces,cfg,0.02,effective,_track_corridors())
-    assert metrics.loc[0,"line_topology"]=="line_endpoint_transition"; assert metrics.loc[0,"v2_membership_state"]=="endpoint_transition"; assert info["line_membership"]["endpoint_transition_vertices"]>=1
+    assert accepted.tolist()==[0]
+    assert info["max_triangle_edge_m"]==2.0
+    assert info["max_triangle_edge_mode"]=="manual"
 
 
 def test_pipeline_creates_v02_products(tmp_path: Path) -> None:
@@ -94,5 +102,5 @@ def test_pipeline_creates_v02_products(tmp_path: Path) -> None:
     with rasterio.open(output_dir/"coverage_mask.tiff") as ds: strict_mask=ds.read(1).astype(bool)
     with rasterio.open(output_dir/"presentation_mask.tiff") as ds: presentation_mask=ds.read(1).astype(bool)
     assert np.all(~strict_mask|presentation_mask); assert np.count_nonzero(presentation!=-9999.0)>=np.count_nonzero(strict!=-9999.0)
-    assert result["surface"]["surface_qc_version"]=="5"; assert result["surface"]["presentation_grid_is_quality_evidence"] is False; assert result["surface"]["delaunay"]["all_vertices_used"] is True; assert result["surface"]["presentation_mesh"]["written"] is True
-    assert result["surface"]["triangle_qc"]["triangle_qc_version"]=="survey-aware-v3"; assert result["survey_geometry"]["selected_preset"]["key"]=="AUTO"; assert result["classification"]["primary_depth_source"]=="KOGGERAPP_BEAM"
+    assert result["surface"]["surface_qc_version"]=="standard-gis-tin-v1"; assert result["surface"]["presentation_grid_is_quality_evidence"] is False; assert result["surface"]["delaunay"]["all_vertices_used"] is True; assert result["surface"]["presentation_mesh"]["written"] is True
+    assert result["surface"]["triangle_qc"]["triangle_qc_version"]=="standard-gis-tin-v1"; assert result["survey_geometry"]["selected_preset"]["key"]=="AUTO"; assert result["classification"]["primary_depth_source"]=="KOGGERAPP_BEAM"
