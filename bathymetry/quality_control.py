@@ -12,6 +12,34 @@ class QualityError(RuntimeError):
     pass
 
 
+def _sustained_sentinel_mask(values: pd.Series, config: ProcessingConfig) -> pd.Series:
+    """Return only sustained runs of the configured sonar sentinel.
+
+    A single value equal to the sentinel is not rejected automatically: the field
+    evidence is a long repeated no-valid-bottom state. This keeps the rule narrow
+    and auditable while preventing such runs from entering the bathymetric surface.
+    """
+    sentinel = config.beam_invalid_sentinel_m
+    if sentinel is None:
+        return pd.Series(False, index=values.index)
+    numeric = pd.to_numeric(values, errors="coerce")
+    candidate = pd.Series(
+        np.isclose(
+            numeric.to_numpy(dtype=float),
+            float(sentinel),
+            rtol=0.0,
+            atol=float(config.beam_invalid_sentinel_tolerance_m),
+            equal_nan=False,
+        ),
+        index=values.index,
+    )
+    if not candidate.any():
+        return candidate
+    groups = candidate.ne(candidate.shift(fill_value=False)).cumsum()
+    run_lengths = candidate.groupby(groups).transform("sum")
+    return candidate & run_lengths.ge(max(1, int(config.beam_invalid_sentinel_min_run)))
+
+
 def normalize_observations(csv_result, klf_result, match_result, config: ProcessingConfig) -> pd.DataFrame:
     obs = csv_result.normalized.copy()
     n = len(obs)
@@ -72,6 +100,8 @@ def normalize_observations(csv_result, klf_result, match_result, config: Process
         | (obs["depth_primary_m"] < config.min_depth_m)
         | (obs["depth_primary_m"] > config.max_depth_m)
     )
+    sentinel_depth = _sustained_sentinel_mask(obs["beam_distance_raw_m"], config)
+    invalid_depth = invalid_depth | sentinel_depth
     obs.loc[missing_depth, "depth_quality"] = "missing"
     obs.loc[invalid_depth, "depth_quality"] = "rejected"
 
@@ -79,8 +109,10 @@ def normalize_observations(csv_result, klf_result, match_result, config: Process
         obs.at[idx, "quality_flags"] = obs.at[idx, "quality_flags"] + ["invalid_position"]
     for idx in obs.index[missing_depth]:
         obs.at[idx, "quality_flags"] = obs.at[idx, "quality_flags"] + ["missing_primary_depth"]
-    for idx in obs.index[invalid_depth]:
+    for idx in obs.index[invalid_depth & ~sentinel_depth]:
         obs.at[idx, "quality_flags"] = obs.at[idx, "quality_flags"] + ["invalid_primary_depth"]
+    for idx in obs.index[sentinel_depth]:
+        obs.at[idx, "quality_flags"] = obs.at[idx, "quality_flags"] + ["sonar_no_bottom_sentinel"]
     for idx in obs.index[~obs["rangefinder_available"]]:
         obs.at[idx, "quality_flags"] = obs.at[idx, "quality_flags"] + ["rangefinder_unavailable"]
 
