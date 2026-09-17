@@ -102,5 +102,5 @@ def test_pipeline_creates_v02_products(tmp_path: Path) -> None:
     with rasterio.open(output_dir/"coverage_mask.tiff") as ds: strict_mask=ds.read(1).astype(bool)
     with rasterio.open(output_dir/"presentation_mask.tiff") as ds: presentation_mask=ds.read(1).astype(bool)
     assert np.all(~strict_mask|presentation_mask); assert np.count_nonzero(presentation!=-9999.0)>=np.count_nonzero(strict!=-9999.0)
-    assert result["surface"]["surface_qc_version"]=="5"; assert result["surface"]["presentation_grid_is_quality_evidence"] is False; assert result["surface"]["delaunay"]["all_vertices_used"] is True; assert result["surface"]["presentation_mesh"]["written"] is True
+    assert result["surface"]["surface_qc_version"]=="standard-gis-tin-v1"; assert result["surface"]["presentation_grid_is_quality_evidence"] is False; assert result["surface"]["delaunay"]["all_vertices_used"] is True; assert result["surface"]["presentation_mesh"]["written"] is True
     assert result["surface"]["triangle_qc"]["triangle_qc_version"]=="standard-gis-tin-v1"; assert result["survey_geometry"]["selected_preset"]["key"]=="AUTO"; assert result["classification"]["primary_depth_source"]=="KOGGERAPP_BEAM"
