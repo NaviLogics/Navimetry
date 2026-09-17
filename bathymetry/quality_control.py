@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 from pyproj import CRS,Transformer
 from bathymetry.models import ProcessingConfig
+from bathymetry.matcher import match_csv_to_klf
 
 class QualityError(RuntimeError):pass
 
@@ -18,6 +19,8 @@ def _sustained_sentinel_mask(values:pd.Series,config:ProcessingConfig)->pd.Serie
 def normalize_observations(csv_result,klf_result,match_result,config:ProcessingConfig)->pd.DataFrame:
     obs=csv_result.normalized.copy(); n=len(obs); obs["latitude_deg"]=obs["latitude_raw_deg"]; obs["longitude_deg"]=obs["longitude_raw_deg"]; obs["beam_distance_used_m"]=obs["beam_distance_raw_m"]; obs["depth_primary_m"]=obs["beam_distance_raw_m"]; obs["depth_source"]=config.depth_source; obs["position_source"]="CSV_COORDINATES"; obs["x_m"]=np.nan; obs["y_m"]=np.nan; obs["timestamp_utc"]=None; obs["timestamp_quality"]="unavailable"; obs["time_quality"]="unavailable"; obs["attitude_quality"]="unavailable"; obs["coverage_quality"]="unknown"; obs["manual_edit_status"]="unknown"; obs["offset_applied_in_navimetry"]=False; obs["quality_flags"]=[[] for _ in range(n)]
     id_dist_count=int(klf_result.inventory.id_counts.get(2,0)) if klf_result is not None else 0; raw_rf=obs["rangefinder_raw_m"]; unavailable=(raw_rf.isna()|(raw_rf==0)) if config.rangefinder_zero_is_unavailable and id_dist_count==0 else raw_rf.isna(); obs["rangefinder_m"]=raw_rf.where(~unavailable,np.nan); obs["rangefinder_available"]=~unavailable; obs["rangefinder_unavailable_reason"]=np.where(unavailable,config.rangefinder_unavailable_reason if id_dist_count==0 else "missing",None)
+    if klf_result is not None and hasattr(klf_result,"sonar_cycles") and not klf_result.sonar_cycles.empty:
+        match_result,_=match_csv_to_klf(csv_result.normalized,klf_result.global_position,klf_result.sonar_cycles,klf_result.gps_raw,klf_result.attitude,klf_result.estimator_status,klf_result.system_time)
     if match_result is not None:
         for c in match_result.columns:obs[c]=match_result[c].values
         matched=obs["global_position_ref"].notna() if "global_position_ref" in obs else pd.Series(False,index=obs.index)
