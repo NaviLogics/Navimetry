@@ -10,11 +10,24 @@ def test_sonar_cycle_alignment_and_quality_attachment():
     att=pd.DataFrame({"kogger_ltime_ms":[1000,1100,1200],"roll_rad":[0.,0.,0.],"pitch_rad":[0.,0.,0.],"yaw_rad":[1.,1.,1.]})
     est=pd.DataFrame({"kogger_ltime_ms":[1000,1100,1200],"pos_horiz_accuracy_m":[.4,.4,.4],"pos_vert_accuracy_m":[.3,.3,.3],"solution_status_flags":[831,831,831]})
     out,report=match_csv_to_klf(csv,gpi,sonar,gps,att,est,None)
-    assert report["selected_row_to_cycle_offset"]==-1
+    assert report["cycle_index_source"]=="row_index"
+    assert report["selected_index_to_cycle_offset"]==-1
     assert report["alignment_coordinate_agreement"]==1.0
     assert out.loc[1,"gps_fix_type"]==3
     assert out.loc[1,"attitude_age_ms"]==0
     assert out.loc[1,"estimator_pos_horiz_accuracy_m"]==.4
+
+
+def test_edited_subset_uses_csv_number_to_preserve_original_cycle_identity():
+    sonar=pd.DataFrame({"sonar_cycle_index":range(8),"frame_index":range(100,108),"kogger_ltime_ms":[1000,1100,1200,1300,1400,1500,1600,1700]})
+    gpi=pd.DataFrame({"frame_index":range(200,208),"kogger_ltime_ms":[1000,1100,1200,1300,1400,1500,1600,1700],"px4_boot_time_ms":[500,600,700,800,900,1000,1100,1200],"latitude_deg":[55+i*1e-6 for i in range(8)],"longitude_deg":[37+i*1e-6 for i in range(8)]})
+    csv=pd.DataFrame({"csv_number":[3,4,5],"latitude_raw_deg":[55.000003,55.000004,55.000005],"longitude_raw_deg":[37.000003,37.000004,37.000005]})
+    out,report=match_csv_to_klf(csv,gpi,sonar)
+    assert report["cycle_index_source"]=="csv_number"
+    assert report["selected_index_to_cycle_offset"]==0
+    assert report["alignment_coordinate_agreement"]==1.0
+    assert list(out["kogger_time_ms"])==[1300.,1400.,1500.]
+    assert report["matched_gpi"]==3
 
 
 def test_alignment_survives_px4_boot_reset_because_kogger_time_is_primary():
