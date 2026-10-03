@@ -22,3 +22,8 @@ class ProcessingConfig:
     max_triangle_edge_m: float | None = None
     min_depth_m: float = 0.05
     max_depth_m: float = 100.0
+    # Absolute elevations: set when the CSV holds the antenna altitude (KoggerApp «GNSS Altitude MSL»)
+    altitude_field: str | None = None
+    utc_date_field: str | None = None
+    utc_time_field: str | None = None
+    antenna_to_transducer_m: float = 0.470
