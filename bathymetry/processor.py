@@ -18,6 +18,14 @@ from pyproj import CRS, Transformer
 from rasterio.transform import from_origin
 from scipy.interpolate import LinearNDInterpolator
 from scipy.spatial import Delaunay, QhullError, cKDTree
+from bathymetry.elevation import (
+    HEIGHT_SYSTEM,
+    antenna_altitude,
+    beam_rejects,
+    bottom_elevation,
+    parse_utc,
+    time_axis,
+)
 from bathymetry.models import CsvInspection, ProcessingConfig
 class ProcessingError(Exception):
     """Ошибка обработки батиметрических данных."""
@@ -253,6 +261,90 @@ def normalize_numeric(series: pd.Series) -> pd.Series:
         ),
         errors="coerce",
     )
+def _add_elevation(
+    quality: pd.DataFrame,
+    source: pd.DataFrame,
+    config: ProcessingConfig,
+) -> str:
+    """
+    Добавляет высоту антенны, UTC и отметку дна; отбраковывает
+    малые и выбросные дальности и строки без высоты.
+    Возвращает ось времени: «utc» или «number».
+    """
+    utc_fields = [
+        config.utc_date_field,
+        config.utc_time_field,
+    ]
+    missing = [
+        field
+        for field in [config.altitude_field, *utc_fields]
+        if field and field not in source.columns
+    ]
+    if missing:
+        raise ProcessingError(
+            "В CSV отсутствуют поля: "
+            + ", ".join(missing)
+        )
+    if all(utc_fields):
+        utc = parse_utc(
+            source[config.utc_date_field],
+            source[config.utc_time_field],
+        )
+    else:
+        utc = pd.Series(np.nan, index=source.index)
+    number = (
+        normalize_numeric(source["Number"])
+        if "Number" in source.columns
+        else pd.Series(np.nan, index=source.index)
+    )
+    if number.isna().any():
+        number = pd.Series(
+            np.arange(len(source), dtype=np.float64),
+            index=source.index,
+        )
+    axis = time_axis(utc, number)
+    altitude = antenna_altitude(
+        normalize_numeric(
+            source[config.altitude_field]
+        ),
+        axis,
+    )
+    altitude.index = quality.index
+    quality["utc_s"] = utc.to_numpy()
+    quality["utc"] = (
+        pd.to_datetime(utc, unit="s", utc=True)
+        .dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        .str.replace(r"\d{3}Z$", "Z", regex=True)
+        .fillna("")
+        .to_numpy()
+    )
+    quality["alt_antenna_m"] = altitude["alt_antenna_m"]
+    quality["alt_source"] = altitude["alt_source"]
+    quality["alt_reason"] = altitude["alt_reason"]
+    quality["elevation_m"] = bottom_elevation(
+        quality["alt_antenna_m"],
+        quality["beam_distance_m"],
+        config.antenna_to_transducer_m,
+    )
+    beam_reasons = beam_rejects(
+        quality["beam_distance_m"]
+    )
+    valid = quality["quality_status"] == "valid"
+    rejected_beam = valid & (beam_reasons != "")
+    quality.loc[rejected_beam, "quality_status"] = "rejected"
+    quality.loc[rejected_beam, "quality_reason"] = beam_reasons[
+        rejected_beam
+    ]
+    no_altitude = (
+        (quality["quality_status"] == "valid")
+        & quality["alt_antenna_m"].isna()
+    )
+    quality.loc[no_altitude, "quality_status"] = "rejected"
+    quality.loc[no_altitude, "quality_reason"] = quality.loc[
+        no_altitude,
+        "alt_reason",
+    ]
+    return axis.kind
 def read_and_prepare(
     config: ProcessingConfig,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -366,6 +458,13 @@ def read_and_prepare(
         invalid_depth,
         "quality_reason",
     ] = "Глубина вне допустимого диапазона"
+    elevation_mode = config.altitude_field is not None
+    if elevation_mode:
+        quality.attrs["time_axis"] = _add_elevation(
+            quality,
+            source,
+            config,
+        )
     try:
         source_crs = CRS.from_user_input(
             config.input_crs
@@ -490,6 +589,25 @@ def read_and_prepare(
                 "включена в медианную агрегацию"
             ),
         ]
+    aggregations = dict(
+        x_m=("x_m", "median"),
+        y_m=("y_m", "median"),
+        depth_m=("depth_m", "median"),
+        beam_distance_m=(
+            "beam_distance_m",
+            "median",
+        ),
+        sample_count=(
+            "source_row",
+            "count",
+        ),
+    )
+    if elevation_mode:
+        aggregations.update(
+            alt_antenna_m=("alt_antenna_m", "median"),
+            elevation_m=("elevation_m", "median"),
+            utc_s=("utc_s", "min"),
+        )
     aggregated = (
         valid_rows.groupby(
             [
@@ -498,20 +616,16 @@ def read_and_prepare(
             ],
             as_index=False,
         )
-        .agg(
-            x_m=("x_m", "median"),
-            y_m=("y_m", "median"),
-            depth_m=("depth_m", "median"),
-            beam_distance_m=(
-                "beam_distance_m",
-                "median",
-            ),
-            sample_count=(
-                "source_row",
-                "count",
-            ),
-        )
+        .agg(**aggregations)
     )
+    if elevation_mode:
+        aggregated["utc"] = (
+            pd.to_datetime(aggregated["utc_s"], unit="s", utc=True)
+            .dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            .str.replace(r"\d{3}Z$", "Z", regex=True)
+            .fillna("")
+        )
+        aggregated = aggregated.drop(columns="utc_s")
     if len(aggregated) < 3:
         raise ProcessingError(
             "После агрегации совпадающих точек "
@@ -522,14 +636,16 @@ def write_xyz(
     points: pd.DataFrame,
     path: Path,
 ) -> None:
-    """Записывает принятые точки в XYZ."""
-    points[
-        [
-            "x_m",
-            "y_m",
-            "depth_m",
-        ]
-    ].to_csv(
+    """
+    Записывает принятые точки в XYZ: X Y −глубина-как-есть,
+    при наличии отметок — X Y отметка глубина.
+    """
+    columns = (
+        ["x_m", "y_m", "elevation_m", "depth_m"]
+        if "elevation_m" in points.columns
+        else ["x_m", "y_m", "depth_m"]
+    )
+    points[columns].to_csv(
         path,
         sep=" ",
         index=False,
@@ -598,7 +714,12 @@ def write_las(
     depth_values = points["depth_m"].to_numpy(
         dtype=np.float64
     )
-    z_values = -depth_values
+    # С высотой антенны Z — отметка дна, иначе минус глубина
+    z_values = (
+        points["elevation_m"].to_numpy(dtype=np.float64)
+        if "elevation_m" in points.columns
+        else -depth_values
+    )
     for name, values in (
         ("X", x_values),
         ("Y", y_values),
@@ -1007,6 +1128,13 @@ def run_pipeline(
             "Поправка до трансдьюсера "
             "не может быть отрицательной"
         )
+    if not math.isfinite(
+        config.antenna_to_transducer_m
+    ):
+        raise ProcessingError(
+            "Превышение антенны над излучателем "
+            "должно быть числом"
+        )
     if config.min_depth_m >= config.max_depth_m:
         raise ProcessingError(
             "Минимальная глубина должна быть "
@@ -1188,6 +1316,64 @@ def run_pipeline(
             "stored in extra field depth_m"
         ),
     }
+    if "elevation_m" in points.columns:
+        reasons = quality.loc[
+            quality["quality_status"] == "rejected",
+            "quality_reason",
+        ].fillna("")
+        report.update(
+            {
+                "height_system": HEIGHT_SYSTEM,
+                "antenna_to_transducer_m": (
+                    config.antenna_to_transducer_m
+                ),
+                "elevation_formula": (
+                    "elevation_m = alt_antenna_m "
+                    "- antenna_to_transducer_m "
+                    "- beam_distance_m"
+                ),
+                "assumptions": [
+                    "Вертикальный луч: крен и дифферент "
+                    "не учитываются",
+                    "Высота KoggerApp — высота антенны "
+                    "(MAVLink GPS_RAW_INT)",
+                ],
+                "time_axis": quality.attrs.get(
+                    "time_axis",
+                    "number",
+                ),
+                "rows_with_measured_altitude": int(
+                    (quality["alt_source"] == "measured").sum()
+                ),
+                "rows_with_interpolated_altitude": int(
+                    (quality["alt_source"] == "interpolated").sum()
+                ),
+                "rows_without_altitude": int(
+                    quality["alt_antenna_m"].isna().sum()
+                ),
+                "rejected_rows_by_reason": {
+                    str(reason): int(count)
+                    for reason, count in reasons.value_counts().items()
+                },
+                "minimum_elevation_m": float(
+                    points["elevation_m"].min()
+                ),
+                "median_elevation_m": float(
+                    points["elevation_m"].median()
+                ),
+                "maximum_elevation_m": float(
+                    points["elevation_m"].max()
+                ),
+                "las_z_definition": (
+                    "z = elevation_m; positive depth is "
+                    "stored in extra field depth_m"
+                ),
+                "xyz_columns": "x y elevation_m depth_m",
+                "surface_and_maps": (
+                    "OBJ/STL, GeoTIFF и PDF пока по глубинам"
+                ),
+            }
+        )
     (
         output_dir / "processing_report.json"
     ).write_text(
@@ -1222,6 +1408,12 @@ def run_pipeline(
         ),
         "min_depth_m": config.min_depth_m,
         "max_depth_m": config.max_depth_m,
+        "altitude_field": config.altitude_field,
+        "utc_date_field": config.utc_date_field,
+        "utc_time_field": config.utc_time_field,
+        "antenna_to_transducer_m": (
+            config.antenna_to_transducer_m
+        ),
     }
     (
         output_dir / "processing_config.json"
