@@ -36,7 +36,11 @@ GPS_FIX_RTK_FIXED = 6
 
 def x25_crc(data: bytes, crc: int = 0xFFFF) -> int:
     """MAVLink checksum (CRC-16/MCRF4XX, X.25)."""
-    return 0
+    for byte in data:
+        tmp = byte ^ (crc & 0xFF)
+        tmp = (tmp ^ (tmp << 4)) & 0xFF
+        crc = ((crc >> 8) ^ (tmp << 8) ^ (tmp << 3) ^ (tmp >> 4)) & 0xFFFF
+    return crc
 
 
 @dataclass
@@ -101,9 +105,88 @@ class KlfLog:
         return None if boot is None else boot + message.time_usec / 1e6
 
 
+def _decode(msgid: int, payload: bytes, offset: int) -> SystemTime | GpsRawInt | GlobalPositionInt:
+    if msgid == MSG_SYSTEM_TIME:
+        time_unix_usec, time_boot_ms = struct.unpack_from("<QI", payload)
+        return SystemTime(offset, time_unix_usec, time_boot_ms)
+    if msgid == MSG_GPS_RAW_INT:
+        time_usec, lat, lon, alt = struct.unpack_from("<Qiii", payload)
+        fix_type = payload[28]
+        return GpsRawInt(offset, time_usec, lat / 1e7, lon / 1e7, alt / 1000, fix_type)
+    time_boot_ms, lat, lon, alt = struct.unpack_from("<Iiii", payload)
+    return GlobalPositionInt(offset, time_boot_ms, lat / 1e7, lon / 1e7, alt / 1000)
+
+
 def parse_klf_bytes(data: bytes, path: Path | None = None) -> KlfLog:
     """Find the MAVLink frames of the known messages in a KLF byte stream; frames failing their CRC are dropped."""
-    return KlfLog(path=path or Path())
+    log = KlfLog(path=path or Path())
+    position = 0
+    length = len(data)
+    start = re.compile(b"[\xfe\xfd]")
+    while True:
+        match = start.search(data, position)
+        if match is None:
+            break
+        index = match.start()
+        frame = _read_frame(data, index, length)
+        if frame is None:
+            position = index + 1
+            continue
+        kind, msgid, payload, frame_end = frame
+        if kind == "bad_crc":
+            log.frames_bad_crc += 1
+            position = index + 1
+            continue
+        message = _decode(msgid, payload, index)
+        if isinstance(message, SystemTime):
+            log.system_times.append(message)
+        elif isinstance(message, GpsRawInt):
+            log.gps_raw.append(message)
+        else:
+            log.global_positions.append(message)
+        position = frame_end
+    return log
+
+
+def _read_frame(data: bytes, index: int, length: int):
+    stx = data[index]
+    if stx == MAVLINK_V1_STX:
+        header = 6
+        if index + header > length:
+            return None
+        payload_len = data[index + 1]
+        msgid = data[index + 5]
+        signature = 0
+    else:
+        header = 10
+        if index + header > length:
+            return None
+        payload_len = data[index + 1]
+        incompat = data[index + 2]
+        msgid = data[index + 7] | (data[index + 8] << 8) | (data[index + 9] << 16)
+        signature = 13 if incompat & 0x01 else 0
+        # Messages over 255 are not ones read here
+        if msgid > 255:
+            return None
+    known = MESSAGES.get(msgid)
+    if known is None:
+        return None
+    crc_extra, base_len, full_len = known
+    # v1 frames carry the base payload, maybe with extensions; v2 frames may truncate trailing zeros
+    if stx == MAVLINK_V1_STX and not base_len <= payload_len <= full_len:
+        return None
+    if stx == MAVLINK_V2_STX and not 1 <= payload_len <= full_len:
+        return None
+    frame_end = index + header + payload_len + 2 + signature
+    if frame_end > length:
+        return None
+    body = data[index + 1 : index + header + payload_len]
+    expected = x25_crc(bytes([crc_extra]), x25_crc(body))
+    received = data[index + header + payload_len] | (data[index + header + payload_len + 1] << 8)
+    if expected != received:
+        return ("bad_crc", msgid, b"", index + 1)
+    payload = data[index + header : index + header + payload_len].ljust(full_len, b"\0")
+    return ("ok", msgid, payload, frame_end)
 
 
 def read_klf(path: Path) -> KlfLog:
